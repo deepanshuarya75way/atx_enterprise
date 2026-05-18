@@ -24,30 +24,21 @@ module.exports = {
   // Max 1000 chars (app limit).
   connectionMessage:
     'Hi {{first_name}},\n\n' +
-    'We, 75way Technologies, will be attending Asia Tech x Singapore 2026. ' +
-    'At the event, we\'ll showcase AI solutions, IoT and Blockchain integrations, ' +
-    'and custom web/mobile apps.\n' +
-    'We\'ve also launched an AI Agent Store, a modular ecosystem where enterprises ' +
-    'can deploy ready-to-integrate AI agents.\n\n' +
-    'AI Sales Agent\n' +
-    'AI Marketing Agent\n' +
-    'AI Finance Agent\n' +
-    'Customer Support Agent\n' +
-    'AI Voice Agent\n' +
-    'AI IT Agent\n' +
-    'Conversational AI Agent\n' +
-    'AI Code Assistant\n' +
-    'AI Healthcare Agent\n' +
-    'AI Travel Agent\n' +
-    'AI Banking Agent\n' +
-    'E-commerce AI Agents\n' +
-    'AI Real Estate Agent\n' +
-    'AI Logistics Agent\n' +
-    'AI Education Agent\n\n' +
-    'There are many more. If this aligns with your 2026 roadmap, ' +
-    'We can arrange a short virtual call on this week or next week\n\n' +
-    'Connect with Us:\n' +
-    'Website: www.75way.com',
+    'We\'re exhibiting at the ATX Summit, Singapore, from May 20–22, 2026.\n' +
+    'We help businesses automate repetitive workflows, reduce operational load, ' +
+    'and improve customer response efficiency with AI and Agentic AI systems.\n\n' +
+    'Our solutions include:\n' +
+    '1. Ready-Made AI agents for process automation\n' +
+    '2. AI chatbots & voice assistants for customer support\n' +
+    '3. AI-powered apps and workflow systems\n' +
+    '4. Advanced data analytics for business operations\n' +
+    '5. AI-driven sales automation systems to close deals\n\n' +
+    'If improving operational efficiency or scaling automation is on your roadmap, ' +
+    'we\'d be glad to connect at the event or schedule a 30-minute strategic AI ' +
+    'consultation to share relevant use cases.\n\n' +
+    'Looking forward to your response!\n' +
+    'Warm Regards,\n' +
+    'Team https://75way.com/',
 
   // ── Timing (milliseconds) ──────────────────────────────────────────────────
   timing: {

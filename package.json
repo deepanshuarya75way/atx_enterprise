@@ -1,0 +1,12 @@
+{
+  "name": "atx-event-connector",
+  "version": "1.0.0",
+  "description": "Send connection requests in the Asia Tech x Singapore 2026 app",
+  "main": "scraper.js",
+  "scripts": {
+    "start": "node scraper.js"
+  },
+  "dependencies": {
+    "webdriverio": "^8.39.0"
+  }
+}

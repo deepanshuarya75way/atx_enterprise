@@ -24,21 +24,20 @@ module.exports = {
   // Max 1000 chars (app limit).
   connectionMessage:
     'Hi {{first_name}},\n\n' +
-    'We\'re exhibiting at the ATX Summit, Singapore, from May 20–22, 2026.\n' +
-    'We help businesses automate repetitive workflows, reduce operational load, ' +
-    'and improve customer response efficiency with AI and Agentic AI systems.\n\n' +
-    'Our solutions include:\n' +
-    '1. Ready-Made AI agents for process automation\n' +
+    'At the ATX Summit, businesses will explore AI and automation tools to reduce ' +
+    'operational costs and scale growth.\n\n' +
+    'We at 75way help you build and adopt AI solutions, AI agents, apps, and software ' +
+    'to automate workflows. Our solutions include:\n' +
+    '1. Ready-made AI agents for process automation\n' +
     '2. AI chatbots & voice assistants for customer support\n' +
-    '3. AI-powered apps and workflow systems\n' +
-    '4. Advanced data analytics for business operations\n' +
-    '5. AI-driven sales automation systems to close deals\n\n' +
-    'If improving operational efficiency or scaling automation is on your roadmap, ' +
-    'we\'d be glad to connect at the event or schedule a 30-minute strategic AI ' +
-    'consultation to share relevant use cases.\n\n' +
-    'Looking forward to your response!\n' +
-    'Warm Regards,\n' +
-    'Team https://75way.com/',
+    '3. Custom & on-demand mobile apps industry-specific needs\n' +
+    '4. Enterprise and custom software solutions\n' +
+    '5. Scalable websites and web apps\n' +
+    '6. Advanced analytics and AI-driven BI systems\n\n' +
+    'If AI & tech initiatives are part of your 2026 roadmap, we would be glad to ' +
+    'schedule a 30-minute strategic discussion to explore relevant use cases and ' +
+    'opportunities for your business.\n\n' +
+    'Connect with us: https://75way.com/',
 
   // ── Timing (milliseconds) ──────────────────────────────────────────────────
   timing: {

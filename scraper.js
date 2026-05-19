@@ -71,6 +71,33 @@ function makeProfileId(name, designation, company) {
     .join(' | ');
 }
 
+/**
+ * Build a name→status map from all saved profiles.
+ * Used as a fallback: profiles saved via swipe use null designation/company so
+ * their composite key differs from the full key on the list card.
+ * We only skip someone by name if their saved status is a terminal one
+ * (sent / connected / pending) — NOT if they were skipped due to rate-limit,
+ * so those get retried automatically.
+ */
+const TERMINAL_STATUSES = new Set(['sent', 'connected', 'pending']);
+
+function buildProcessedNameSet(profiles) {
+  const s = new Set();
+  for (const p of profiles.values()) {
+    if (p.name && TERMINAL_STATUSES.has(p.status)) {
+      s.add(p.name.trim().toLowerCase());
+    }
+  }
+  return s;
+}
+
+function isAlreadyProcessed(profiles, processedNames, name, designation, company) {
+  // Exact composite key match — trust it regardless of status
+  if (profiles.has(makeProfileId(name, designation, company))) return true;
+  // Name-only fallback for terminal statuses saved under a different key form
+  return processedNames.has((name || '').trim().toLowerCase());
+}
+
 function loadProfiles() {
   try {
     if (fs.existsSync(VISITED_FILE)) {
@@ -412,6 +439,7 @@ async function scrapeProfileExtras(driver) {
 const PROFILE_CHROME = new Set([
   'Book a meeting', 'Pending', 'Connect', 'Meet instead',
   'Back', 'Share', 'About me', 'Biography', 'See more', 'see more slots',
+  'Qualify', 'Qualify your connection', 'Connected',
 ]);
 
 function getCurrentProfileName(elements) {
@@ -426,8 +454,9 @@ function getCurrentProfileName(elements) {
     // Name area: above the buttons row, below the avatar
     if (b.y1 < 400 || b.y1 > 700) continue;
     if (PROFILE_CHROME.has(t)) continue;
-    // Skip all-caps section headers / badges
-    if (t === t.toUpperCase() && t.length > 2) continue;
+    // Skip single-word all-caps badges (e.g. "PREMIUM", "VIP", "SPEAKER").
+    // Multi-word all-caps is a valid name style (e.g. "SEAM CHINSENG") — keep it.
+    if (t === t.toUpperCase() && t.length > 2 && !t.includes(' ')) continue;
     // Skip date/time strings
     if (/^\d|^[0-9:]+\s*(am|pm)/i.test(t)) continue;
     if (t.length < 2) continue;
@@ -469,32 +498,40 @@ function findConnectButtonBounds(elements) {
 
 /**
  * Check profile state from a single page-source call.
- * Returns: { name, isPending, hasConnectButton, connectCenter }
+ * Returns: { name, isPending, isConnected, hasConnectButton, connectCenter }
  *
- * isPending: "Pending" text has REAL bounds (it's on the current card, not adjacent).
- * Adjacent cards' "Pending" badges have [0,0] bounds and are ignored.
+ * Real-bounds rule: only TextView nodes with non-zero bounds belong to the
+ * CURRENT (center) card. Adjacent cards' elements all have [0,0][0,0] bounds.
+ *
+ * isConnected is true when:
+ *   - A "Connected" label has real bounds, OR
+ *   - A "Qualify your connection" panel has real bounds
+ *   (both appear on already-connected profiles — see UI dump)
+ * When isConnected, hasConnectButton is forced false so we never attempt to tap.
  */
 async function readProfileState(driver) {
   const xml      = await driver.getPageSource();
   const elements = parseSource(xml);
   const name     = getCurrentProfileName(elements);
 
-  // Only flag isPending if a "Pending" TextView has real bounds on the current card
-  let isPending = false;
-  for (const el of elements) {
-    if (!el._tag.includes('TextView')) continue;
-    if ((el.text || '').trim() !== 'Pending') continue;
-    const b = parseBoundsRect(el.bounds);
-    if (b && !(b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) {
-      isPending = true;
-      break;
+  function hasRealBoundsText(target) {
+    for (const el of elements) {
+      if (!el._tag.includes('TextView')) continue;
+      if ((el.text || '').trim() !== target) continue;
+      const b = parseBoundsRect(el.bounds);
+      if (b && !(b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) return true;
     }
+    return false;
   }
 
-  const connectR = findConnectButtonBounds(elements);
+  const isPending    = hasRealBoundsText('Pending');
+  const isConnected  = hasRealBoundsText('Connected') || hasRealBoundsText('Qualify your connection');
+
+  const connectR = isConnected ? null : findConnectButtonBounds(elements);
   return {
     name,
     isPending,
+    isConnected,
     hasConnectButton: !!connectR,
     connectCenter:    connectR ? { x: connectR.cx, y: connectR.cy } : null,
   };
@@ -531,7 +568,16 @@ async function swipeToNextProfile(driver) {
 async function sendConnectionMessage(driver, firstName) {
   // Wait for the dialog's EditText to appear
   const msgInput = await waitForEl(driver, '//android.widget.EditText', cfg.timing.dialogTimeout);
-  if (!msgInput) throw new Error('Message EditText not found in connect dialog');
+  if (!msgInput) {
+    // Check whether a "Qualify your connection" sheet opened instead of the message dialog
+    try {
+      const xml = await driver.getPageSource();
+      if (xml.includes('Qualify your connection') || xml.includes('Qualify')) {
+        throw new Error('QUALIFY_CONNECTION');
+      }
+    } catch (inner) { if (inner.message === 'QUALIFY_CONNECTION') throw inner; }
+    throw new Error('Message EditText not found in connect dialog');
+  }
 
   // Build message (keep newlines — this app supports multiline input)
   let message = cfg.connectionMessage.replace('{{first_name}}', firstName);
@@ -654,199 +700,261 @@ async function main() {
   console.log('Connected. Starting…\n');
 
   try {
-    // ── Phase 1: Scroll the list to find the first unprocessed card ─────────
-    console.log('Phase 1: Scanning list for first unprocessed person…');
+    let batch          = 0;
+    let lastSwipedName = null; // name of the last profile seen when pager was exhausted
 
-    let entryCard = null;
-    let staleScrolls = 0;
-
-    while (staleScrolls <= cfg.maxStaleScrolls) {
-      const cards = await scanList(driver);
-
-      entryCard = cards.find(c => {
-        if (!c.name) return false;
-        const pid = makeProfileId(c.name, c.designation, c.company);
-        return !profiles.has(pid);
-      });
-      if (entryCard) {
-        console.log(`  → First unprocessed: "${entryCard.name}"\n`);
-        break;
-      }
-
-      const moved = await scrollListDown(driver);
-      if (!moved) {
-        staleScrolls++;
-        if (staleScrolls > cfg.maxStaleScrolls) {
-          console.log('All attendees have been processed!');
-          break;
-        }
-      } else {
-        staleScrolls = 0;
-      }
-    }
-
-    if (!entryCard) {
-      console.log('No unprocessed person found. Nothing to do.');
-      return;
-    }
-
-    // ── Phase 2: Tap the entry card to open the profile view ────────────────
-    console.log(`Phase 2: Opening profile for "${entryCard.name}"…`);
-    await tapAt(driver, entryCard.center.x, entryCard.center.y);
-    await sleep(cfg.timing.afterTap);
-
-    const profileReady = await waitForEl(
-      driver,
-      '//android.widget.TextView[@text="Book a meeting"]',
-      cfg.timing.profileTimeout,
-    );
-    if (!profileReady) {
-      console.error('Profile page did not load. Aborting.');
-      return;
-    }
-    console.log('  Profile view open.\n');
-
-    // ── Phase 3: Swipe-based processing loop ────────────────────────────────
-    console.log('Phase 3: Processing profiles (swipe navigation)…');
-
-    // currentCard tracks the list-card data (name/designation/company) for the
-    // profile currently on screen — starts as the entry card, advances each swipe.
-    let currentCard  = entryCard;
-    let swipeMisses  = 0;
-    let prevName     = null;
-
+    // ── Outer batch loop ───────────────────────────────────────────────────────
+    // Each iteration: scroll the list to the correct resume point, tap the next
+    // unprocessed person, swipe through ~40 profiles, return to the list, repeat.
     while (true) {
-      // Read the current profile state — retry once if name wasn't detected
-      let state = await readProfileState(driver);
-      if (!state.name) {
-        await sleep(600);
-        state = await readProfileState(driver);
-      }
-      const { name, isPending, hasConnectButton, connectCenter } = state;
+      batch++;
 
-      // End-of-pager: same profile detected multiple times in a row
-      if (name && name === prevName) {
-        swipeMisses++;
-        console.log(`  (same profile "${name}" again — swipe miss ${swipeMisses}/${cfg.maxSwipeMisses})`);
-        if (swipeMisses >= cfg.maxSwipeMisses) {
-          console.log('\nEnd of profile pager reached. Done.');
+      // ── Phase 1: Scroll list to find the next unprocessed card ────────────
+      console.log(`\n[Batch ${batch}] Scanning list for next unprocessed person…`);
+      if (lastSwipedName) {
+        console.log(`  Resuming after "${lastSwipedName}"…`);
+      }
+
+      const processedNames = buildProcessedNameSet(profiles);
+
+      let entryCard    = null;
+      let staleScrolls = 0;
+
+      // When lastSwipedName is set we must scroll the list until that person is
+      // visible, then look for unprocessed cards that appear AFTER them.
+      // seenAnchor flips to true once we have scrolled to / past the anchor.
+      let seenAnchor = (lastSwipedName === null);
+
+      while (staleScrolls <= cfg.maxStaleScrolls) {
+        const cards = await scanList(driver);
+
+        if (!seenAnchor) {
+          // ── Positioning phase: scroll until lastSwipedName is visible ──
+          const anchorIdx = cards.findIndex(c =>
+            (c.name || '').trim().toLowerCase() === lastSwipedName.trim().toLowerCase()
+          );
+
+          if (anchorIdx >= 0) {
+            seenAnchor = true;
+            // Check cards that appear BELOW the anchor in the current view
+            entryCard = cards.slice(anchorIdx + 1).find(c =>
+              c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
+            );
+            if (entryCard) {
+              console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
+              break;
+            }
+            // Nothing unprocessed in the same view — scroll to bring in the next cards
+          }
+
+          const moved = await scrollListDown(driver);
+          if (!moved) {
+            staleScrolls++;
+            if (staleScrolls > cfg.maxStaleScrolls) {
+              // Anchor not found after exhaustive scroll — scan from current position
+              console.warn(`  Could not locate "${lastSwipedName}" in list — scanning from here`);
+              seenAnchor   = true;
+              staleScrolls = 0;
+            }
+          } else {
+            staleScrolls = 0;
+          }
+          continue;
+        }
+
+        // ── Normal scan: find first unprocessed card from current position ──
+        entryCard = cards.find(c =>
+          c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
+        );
+        if (entryCard) {
+          console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
           break;
         }
-        await swipeToNextProfile(driver);
-        continue;
-      }
-      swipeMisses = 0;
 
-      // Keep currentCard in sync: if the detected name matches, trust it;
-      // otherwise fall back to whatever the list gave us as the entry.
-      if (name && currentCard.name !== name) {
-        currentCard = { name, designation: null, company: null, center: currentCard.center };
-      }
-      prevName = name || prevName;
-
-      const profileId  = makeProfileId(
-        currentCard.name,
-        currentCard.designation,
-        currentCard.company,
-      );
-      const displayName = currentCard.name || '(unknown)';
-
-      // Already processed?
-      if (profiles.has(profileId)) {
-        console.log(`  [skip] "${displayName}" — already processed`);
-        await swipeToNextProfile(driver);
-        continue;
-      }
-
-      // ── Scrape contact details + social platforms for every new profile ──
-      let extras = { contact: [], socialMedia: [] };
-      try {
-        extras = await scrapeProfileExtras(driver);
-        const parts = [];
-        if (extras.contact.length)    parts.push(`${extras.contact.length} contact(s)`);
-        if (extras.socialMedia.length) parts.push(extras.socialMedia.join(', '));
-        if (parts.length) console.log(`    extras: ${parts.join('  |  ')}`);
-      } catch (e) {
-        console.warn(`    (scrape extras failed: ${e.message})`);
-      }
-
-      // No connect button → pending or already connected
-      if (!hasConnectButton) {
-        const reason = isPending ? 'pending' : 'already connected';
-        console.log(`  [skip] "${displayName}" — ${reason}`);
-        upsertProfile(profiles, profileId, {
-          name:        currentCard.name,
-          designation: currentCard.designation,
-          company:     currentCard.company,
-          status:      isPending ? 'pending' : 'connected',
-          contact:     extras.contact,
-          socialMedia: extras.socialMedia,
-        });
-        saveProfiles(profiles);
-        writeCSV(profiles);
-        await swipeToNextProfile(driver);
-        continue;
-      }
-
-      // Rate-limited — save scraped data but defer the connection
-      if (isRateLimited()) {
-        const resumeAt = rateLimitResumesAt();
-        console.log(`  [wait] "${displayName}" — rate-limited until ${resumeAt.toLocaleTimeString()}`);
-        upsertProfile(profiles, profileId, {
-          name:        currentCard.name,
-          designation: currentCard.designation,
-          company:     currentCard.company,
-          status:      'skipped_rate_limit',
-          contact:     extras.contact,
-          socialMedia: extras.socialMedia,
-        });
-        saveProfiles(profiles);
-        writeCSV(profiles);
-        await swipeToNextProfile(driver);
-        continue;
-      }
-
-      // ── Attempt to connect ───────────────────────────────────────────────
-      const firstName = displayName.split(' ')[0];
-      console.log(`[→] "${displayName}"  (connecting as "${firstName}"…)`);
-
-      try {
-        await tapAt(driver, connectCenter.x, connectCenter.y);
-        await sleep(cfg.timing.afterConnect);
-
-        await sendConnectionMessage(driver, firstName);
-
-        sentThisRun++;
-        upsertProfile(profiles, profileId, {
-          name:        currentCard.name,
-          designation: currentCard.designation,
-          company:     currentCard.company,
-          status:      'sent',
-          contact:     extras.contact,
-          socialMedia: extras.socialMedia,
-        });
-        saveProfiles(profiles);
-        writeCSV(profiles);
-        console.log(`    ✓ sent  (total this run: ${sentThisRun})`);
-
-        await sleep(cfg.timing.settle * 3);
-        await swipeToNextProfile(driver);
-
-      } catch (err) {
-        if (err.message === 'RATE_LIMITED') {
-          const { resumeAt, waitMinutes } = setRateLimited();
-          console.warn(`    ⚠ Rate-limited — pausing sends for ${waitMinutes} min (until ${resumeAt.toLocaleTimeString()})`);
-          try { await driver.back(); } catch {}
-          await sleep(cfg.timing.settle);
-          await swipeToNextProfile(driver);
+        const moved = await scrollListDown(driver);
+        if (!moved) {
+          staleScrolls++;
         } else {
-          console.error(`    ✗ Error: ${err.message}`);
-          try { await driver.back(); } catch {}
-          await sleep(cfg.timing.settle);
-          await swipeToNextProfile(driver);
+          staleScrolls = 0;
         }
       }
-    }
+
+      if (!entryCard) {
+        console.log('All attendees have been processed!');
+        break; // exit outer batch loop — we are done
+      }
+
+      // ── Phase 2: Tap the entry card to open the profile pager ─────────────
+      console.log(`  Opening profile for "${entryCard.name}"…`);
+      await tapAt(driver, entryCard.center.x, entryCard.center.y);
+      await sleep(cfg.timing.afterTap);
+
+      const profileReady = await waitForEl(
+        driver,
+        '//android.widget.TextView[@text="Book a meeting"]',
+        cfg.timing.profileTimeout,
+      );
+      if (!profileReady) {
+        console.error('  Profile page did not load — returning to list.');
+        try { await driver.back(); } catch {}
+        await sleep(cfg.timing.afterScroll);
+        continue; // retry outer batch loop
+      }
+      console.log('  Profile view open.\n');
+
+      // ── Phase 3: Swipe-based processing loop (one pager batch ~40 cards) ──
+      let currentCard = entryCard;
+      let swipeMisses = 0;
+      let prevName    = null;
+
+      while (true) {
+        // Read profile state — retry once if name wasn't detected
+        let state = await readProfileState(driver);
+        if (!state.name) {
+          await sleep(600);
+          state = await readProfileState(driver);
+        }
+        const { name, isPending, isConnected, hasConnectButton, connectCenter } = state;
+
+        // End-of-pager: same profile stuck N times — break to list for next batch
+        if (name && name === prevName) {
+          swipeMisses++;
+          console.log(`  (same profile "${name}" — miss ${swipeMisses}/${cfg.maxSwipeMisses})`);
+          if (swipeMisses >= cfg.maxSwipeMisses) {
+            lastSwipedName = name; // remember where the pager stalled
+            console.log(`\n  Pager limit reached at "${name}". Returning to list for batch ${batch + 1}…`);
+            break; // exits swipe loop only — outer loop continues
+          }
+          await swipeToNextProfile(driver);
+          continue;
+        }
+        swipeMisses = 0;
+
+        // Keep currentCard in sync with what's on screen
+        if (name && currentCard.name !== name) {
+          currentCard = { name, designation: null, company: null, center: currentCard.center };
+        }
+        prevName = name || prevName;
+
+        const profileId   = makeProfileId(currentCard.name, currentCard.designation, currentCard.company);
+        const displayName = currentCard.name || '(unknown)';
+
+        // Already processed? (check composite key + name fallback)
+        if (isAlreadyProcessed(profiles, processedNames, currentCard.name, currentCard.designation, currentCard.company)) {
+          console.log(`  [skip] "${displayName}" — already processed`);
+          await swipeToNextProfile(driver);
+          continue;
+        }
+
+        // No connect button → pending / connected / qualify panel — swipe immediately
+        if (!hasConnectButton) {
+          const reason = isPending ? 'pending' : 'already connected';
+          console.log(`  [skip] "${displayName}" — ${reason}`);
+          upsertProfile(profiles, profileId, {
+            name:        currentCard.name,
+            designation: currentCard.designation,
+            company:     currentCard.company,
+            status:      isPending ? 'pending' : 'connected',
+          });
+          saveProfiles(profiles);
+          writeCSV(profiles);
+          await swipeToNextProfile(driver);
+          continue;
+        }
+
+        // ── Scrape contact + social links (only when connect button present) ─
+        let extras = { contact: [], socialMedia: [] };
+        try {
+          extras = await scrapeProfileExtras(driver);
+          const parts = [];
+          if (extras.contact.length)     parts.push(`${extras.contact.length} contact(s)`);
+          if (extras.socialMedia.length) parts.push(extras.socialMedia.join(', '));
+          if (parts.length) console.log(`    extras: ${parts.join('  |  ')}`);
+        } catch (e) {
+          console.warn(`    (scrape extras failed: ${e.message})`);
+        }
+
+        // Rate-limited — save data, defer connection, swipe
+        if (isRateLimited()) {
+          const resumeAt = rateLimitResumesAt();
+          console.log(`  [wait] "${displayName}" — rate-limited until ${resumeAt.toLocaleTimeString()}`);
+          upsertProfile(profiles, profileId, {
+            name:        currentCard.name,
+            designation: currentCard.designation,
+            company:     currentCard.company,
+            status:      'skipped_rate_limit',
+            contact:     extras.contact,
+            socialMedia: extras.socialMedia,
+          });
+          saveProfiles(profiles);
+          writeCSV(profiles);
+          await swipeToNextProfile(driver);
+          continue;
+        }
+
+        // ── Attempt to connect ─────────────────────────────────────────────
+        const firstName = displayName.split(' ')[0];
+        console.log(`[→] "${displayName}"  (connecting as "${firstName}"…)`);
+
+        try {
+          await tapAt(driver, connectCenter.x, connectCenter.y);
+          await sleep(cfg.timing.afterConnect);
+
+          await sendConnectionMessage(driver, firstName);
+
+          sentThisRun++;
+          upsertProfile(profiles, profileId, {
+            name:        currentCard.name,
+            designation: currentCard.designation,
+            company:     currentCard.company,
+            status:      'sent',
+            contact:     extras.contact,
+            socialMedia: extras.socialMedia,
+          });
+          saveProfiles(profiles);
+          writeCSV(profiles);
+          console.log(`    ✓ sent  (total this run: ${sentThisRun})`);
+
+          await sleep(cfg.timing.settle * 3);
+          await swipeToNextProfile(driver);
+
+        } catch (err) {
+          if (err.message === 'RATE_LIMITED') {
+            const { resumeAt, waitMinutes } = setRateLimited();
+            console.warn(`    ⚠ Rate-limited — pausing sends for ${waitMinutes} min (until ${resumeAt.toLocaleTimeString()})`);
+            try { await driver.back(); } catch {}
+            await sleep(cfg.timing.settle);
+            await swipeToNextProfile(driver);
+          } else if (err.message === 'QUALIFY_CONNECTION') {
+            console.log(`  [skip] "${displayName}" — qualify connection prompt (already connected)`);
+            upsertProfile(profiles, profileId, {
+              name:        currentCard.name,
+              designation: currentCard.designation,
+              company:     currentCard.company,
+              status:      'connected',
+            });
+            saveProfiles(profiles);
+            writeCSV(profiles);
+            try { await driver.back(); } catch {}
+            await sleep(cfg.timing.settle);
+            await swipeToNextProfile(driver);
+          } else {
+            console.error(`    ✗ Error: ${err.message}`);
+            try { await driver.back(); } catch {}
+            await sleep(cfg.timing.settle);
+            await swipeToNextProfile(driver);
+          }
+        }
+      } // end swipe loop
+
+      // Pager exhausted — press back to return to the attendee list
+      console.log('  Pressing back to attendee list…');
+      try { await driver.back(); } catch {}
+      await sleep(cfg.timing.afterScroll);
+      await waitForList(driver);
+      // outer batch loop continues from here
+
+    } // end outer batch loop
 
   } finally {
     saveProfiles(profiles);

@@ -979,23 +979,6 @@ async function main() {
           continue;
         }
 
-        // DATA mode: never send connections — just record the profile and move on
-        if (DATA_MODE) {
-          const existingStatus = profiles.get(profileId)?.status;
-          const status = TERMINAL_STATUSES.has(existingStatus) ? existingStatus : 'pending';
-          console.log(`  [data] "${displayName}" — saved (${status})`);
-          upsertProfile(profiles, profileId, {
-            name:        currentCard.name,
-            designation: currentCard.designation,
-            company:     currentCard.company,
-            status,
-          });
-          saveProfiles(profiles);
-          writeCSV(profiles);
-          await swipeToNextProfile(driver);
-          continue;
-        }
-
         // Rate-limited — save data, defer connection, swipe
         if (isRateLimited()) {
           const resumeAt = rateLimitResumesAt();

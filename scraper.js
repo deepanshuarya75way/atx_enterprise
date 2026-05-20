@@ -783,62 +783,70 @@ async function main() {
       let entryCard    = null;
       let staleScrolls = 0;
 
-      // When lastSwipedName is set we must scroll the list until that person is
-      // visible, then look for unprocessed cards that appear AFTER them.
-      // seenAnchor flips to true once we have scrolled to / past the anchor.
-      let seenAnchor = (lastSwipedName === null);
-
-      while (staleScrolls <= cfg.maxStaleScrolls) {
+      if (DATA_MODE) {
+        // ── DATA mode: just tap the first card at the top — visit everyone ──
         const cards = await scanList(driver);
+        entryCard = cards[0] || null;
+        if (entryCard) console.log(`  → Starting from: "${entryCard.name}"\n`);
+      } else {
+        // ── Normal mode: scroll to find first unprocessed card ──────────────
+        // When lastSwipedName is set we must scroll the list until that person
+        // is visible, then look for unprocessed cards that appear AFTER them.
+        // seenAnchor flips to true once we have scrolled to / past the anchor.
+        let seenAnchor = (lastSwipedName === null);
 
-        if (!seenAnchor) {
-          // ── Positioning phase: scroll until lastSwipedName is visible ──
-          const anchorIdx = cards.findIndex(c =>
-            (c.name || '').trim().toLowerCase() === lastSwipedName.trim().toLowerCase()
-          );
+        while (staleScrolls <= cfg.maxStaleScrolls) {
+          const cards = await scanList(driver);
 
-          if (anchorIdx >= 0) {
-            seenAnchor = true;
-            // Check cards that appear BELOW the anchor in the current view
-            entryCard = cards.slice(anchorIdx + 1).find(c =>
-              c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
+          if (!seenAnchor) {
+            // ── Positioning phase: scroll until lastSwipedName is visible ──
+            const anchorIdx = cards.findIndex(c =>
+              (c.name || '').trim().toLowerCase() === lastSwipedName.trim().toLowerCase()
             );
-            if (entryCard) {
-              console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
-              break;
+
+            if (anchorIdx >= 0) {
+              seenAnchor = true;
+              // Check cards that appear BELOW the anchor in the current view
+              entryCard = cards.slice(anchorIdx + 1).find(c =>
+                c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
+              );
+              if (entryCard) {
+                console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
+                break;
+              }
+              // Nothing unprocessed in the same view — scroll to bring in next cards
             }
-            // Nothing unprocessed in the same view — scroll to bring in the next cards
+
+            const moved = await scrollListDown(driver);
+            if (!moved) {
+              staleScrolls++;
+              if (staleScrolls > cfg.maxStaleScrolls) {
+                // Anchor not found after exhaustive scroll — scan from current position
+                console.warn(`  Could not locate "${lastSwipedName}" in list — scanning from here`);
+                seenAnchor   = true;
+                staleScrolls = 0;
+              }
+            } else {
+              staleScrolls = 0;
+            }
+            continue;
+          }
+
+          // ── Normal scan: find first unprocessed card ──────────────────────
+          entryCard = cards.find(c =>
+            c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
+          );
+          if (entryCard) {
+            console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
+            break;
           }
 
           const moved = await scrollListDown(driver);
           if (!moved) {
             staleScrolls++;
-            if (staleScrolls > cfg.maxStaleScrolls) {
-              // Anchor not found after exhaustive scroll — scan from current position
-              console.warn(`  Could not locate "${lastSwipedName}" in list — scanning from here`);
-              seenAnchor   = true;
-              staleScrolls = 0;
-            }
           } else {
             staleScrolls = 0;
           }
-          continue;
-        }
-
-        // ── Normal scan: find first unprocessed card from current position ──
-        entryCard = cards.find(c =>
-          c.name && !isAlreadyProcessed(profiles, processedNames, c.name, c.designation, c.company)
-        );
-        if (entryCard) {
-          console.log(`  → Next unprocessed: "${entryCard.name}"\n`);
-          break;
-        }
-
-        const moved = await scrollListDown(driver);
-        if (!moved) {
-          staleScrolls++;
-        } else {
-          staleScrolls = 0;
         }
       }
 
@@ -922,8 +930,9 @@ async function main() {
         const profileId   = makeProfileId(currentCard.name, currentCard.designation, currentCard.company);
         const displayName = currentCard.name || '(unknown)';
 
-        // Already processed? (composite key + name fallback)
-        if (isAlreadyProcessed(profiles, processedNames, currentCard.name, currentCard.designation, currentCard.company)) {
+        // Already processed? Skip in normal mode only.
+        // In --data mode we visit every profile to fill in missing data.
+        if (!DATA_MODE && isAlreadyProcessed(profiles, processedNames, currentCard.name, currentCard.designation, currentCard.company)) {
           console.log(`  [skip] "${displayName}" — already processed`);
           await swipeToNextProfile(driver);
           continue;
@@ -949,14 +958,20 @@ async function main() {
         // No connect button → pending / connected / qualify panel
         if (!hasConnectButton) {
           const reason = isPending ? 'pending' : 'already connected';
-          console.log(`  [skip] "${displayName}" — ${reason}`);
+          const label  = DATA_MODE ? '[data]' : '[skip]';
+          console.log(`  ${label} "${displayName}" — ${reason}`);
+          // Preserve terminal status already in DB (e.g. 'sent' → don't overwrite to 'pending')
+          const existingStatus = profiles.get(profileId)?.status;
+          const newStatus = TERMINAL_STATUSES.has(existingStatus)
+            ? existingStatus
+            : (isPending ? 'pending' : 'connected');
           upsertProfile(profiles, profileId, {
             name:        currentCard.name,
             designation: currentCard.designation,
             company:     currentCard.company,
-            status:      isPending ? 'pending' : 'connected',
-            contact:     extras.contact,
-            socialMedia: extras.socialMedia,
+            status:      newStatus,
+            contact:     extras.contact.length ? extras.contact : (profiles.get(profileId)?.contact || []),
+            socialMedia: extras.socialMedia.length ? extras.socialMedia : (profiles.get(profileId)?.socialMedia || []),
           });
           saveProfiles(profiles);
           writeCSV(profiles);

@@ -476,6 +476,19 @@ const PROFILE_CHROME = new Set([
  * Returns { name, designation, company } — any field may be null if not found.
  */
 function getCurrentProfileInfo(elements) {
+  // On a regular profile the name/designation/company sit at y≈508–640.
+  // On a "Connected" profile the "Qualify your connection" panel is inserted
+  // at the top, pushing everything down to y≈946–1085.
+  // Detect which layout we're in by checking for the qualify panel with real bounds.
+  const hasQualifyPanel = elements.some(el => {
+    if (!el._tag.includes('TextView')) return false;
+    if ((el.text || '').trim() !== 'Qualify your connection') return false;
+    const b = parseBoundsRect(el.bounds);
+    return b && !(b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0);
+  });
+  const yMin = 400;
+  const yMax = hasQualifyPanel ? 1150 : 700;
+
   const candidates = [];
   for (const el of elements) {
     if (!el._tag.includes('TextView')) continue;
@@ -485,7 +498,7 @@ function getCurrentProfileInfo(elements) {
     // Must have real (non-zero) bounds — CURRENT card's elements only
     if (!b || (b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) continue;
     // Name/designation/company all live in this y band
-    if (b.y1 < 400 || b.y1 > 700) continue;
+    if (b.y1 < yMin || b.y1 > yMax) continue;
     if (PROFILE_CHROME.has(t)) continue;
     // Skip single-word all-caps badges (PREMIUM, VIP…); multi-word all-caps = valid name
     if (t === t.toUpperCase() && t.length > 2 && !t.includes(' ')) continue;

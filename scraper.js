@@ -942,7 +942,7 @@ async function main() {
         // DATA mode: scrape everyone (pending/connected included).
         // Normal mode: only scrape when the connect button is present.
         let extras = { contact: [], socialMedia: [] };
-        const shouldScrape = DATA_MODE || hasConnectButton;
+        const shouldScrape = !DATA_MODE && hasConnectButton;
         if (shouldScrape) {
           try {
             extras = await scrapeProfileExtras(driver);

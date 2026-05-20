@@ -30,5 +30,17 @@ if [ ! -d node_modules ]; then
   npm install
 fi
 
-echo "Starting ATx Enterprise 2026 Connector..."
-node scraper.js
+# ── Mode ───────────────────────────────────────────────────────────────────────
+# Usage:
+#   ./run.sh          — normal mode (auto list navigation, connect only)
+#   ./run.sh --data   — data mode   (scrape all + connect, human navigation at pager end)
+
+MODE=""
+for arg in "$@"; do
+  case "$arg" in
+    --data) MODE="--data" ;;
+  esac
+done
+
+echo "Starting ATx Enterprise 2026 Connector${MODE:+ ($MODE)}..."
+node scraper.js $MODE

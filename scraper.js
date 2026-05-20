@@ -25,9 +25,16 @@
 
 const { remote } = require('webdriverio');
 const { spawnSync } = require('child_process');
+const readline = require('readline');
 const fs   = require('fs');
 const path = require('path');
 const cfg  = require('./config');
+
+// ── Run mode ──────────────────────────────────────────────────────────────────
+// --data  Scrape contact/social for ALL profiles (including pending/connected)
+//         AND send connections.  When the pager exhausts, play an alert and
+//         wait for the human to open the next card manually, then press Enter.
+const DATA_MODE = process.argv.includes('--data');
 
 
 const OUT_DIR      = cfg.outputDir;
@@ -348,6 +355,27 @@ async function scrollListDown(driver) {
   return lastAfter !== lastBefore || cardsAfter.length > cardsBefore.length;
 }
 
+async function scrollListToTop(driver) {
+  const { width, height } = await driver.getWindowSize();
+  // Swipe down in short fast bursts starting from mid-screen.
+  // Starting mid-screen (not y=0) avoids triggering pull-to-refresh.
+  // Stop as soon as the first visible card no longer changes — we're at the top.
+  let prevFirst = null;
+  for (let i = 0; i < 20; i++) {
+    const cards = await scanList(driver);
+    const first  = cards[0]?.name ?? null;
+    if (first !== null && first === prevFirst) break; // top reached — no movement
+    prevFirst = first;
+    await swipeFromTo(
+      driver,
+      Math.round(width / 2), Math.round(height * 0.45),
+      Math.round(width / 2), Math.round(height * 0.75),
+      250, // fast swipe — avoids pull-to-refresh threshold
+    );
+    await sleep(cfg.timing.afterScroll);
+  }
+}
+
 // ── Profile content scroll helpers ───────────────────────────────────────────
 //
 // These operate inside the profile card's content area (y 800–1300) to avoid
@@ -442,29 +470,40 @@ const PROFILE_CHROME = new Set([
   'Qualify', 'Qualify your connection', 'Connected',
 ]);
 
-function getCurrentProfileName(elements) {
+/**
+ * Extract name, designation, and company from the CURRENT profile card.
+ * The layout (top→bottom within y 400–700) is always: name → designation → company.
+ * Returns { name, designation, company } — any field may be null if not found.
+ */
+function getCurrentProfileInfo(elements) {
   const candidates = [];
   for (const el of elements) {
     if (!el._tag.includes('TextView')) continue;
     const t = (el.text || '').trim();
     if (!t || t.toLowerCase() === 'null') continue;
     const b = parseBoundsRect(el.bounds);
-    // Must have real (non-zero) bounds — CURRENT card's elements
+    // Must have real (non-zero) bounds — CURRENT card's elements only
     if (!b || (b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) continue;
-    // Name area: above the buttons row, below the avatar
+    // Name/designation/company all live in this y band
     if (b.y1 < 400 || b.y1 > 700) continue;
     if (PROFILE_CHROME.has(t)) continue;
-    // Skip single-word all-caps badges (e.g. "PREMIUM", "VIP", "SPEAKER").
-    // Multi-word all-caps is a valid name style (e.g. "SEAM CHINSENG") — keep it.
+    // Skip single-word all-caps badges (PREMIUM, VIP…); multi-word all-caps = valid name
     if (t === t.toUpperCase() && t.length > 2 && !t.includes(' ')) continue;
-    // Skip date/time strings
     if (/^\d|^[0-9:]+\s*(am|pm)/i.test(t)) continue;
     if (t.length < 2) continue;
     candidates.push({ text: t, y: b.y1 });
   }
-  // Sort by y (top-most = name, then designation, company…)
   candidates.sort((a, b) => a.y - b.y);
-  return candidates[0]?.text ?? null;
+  return {
+    name:        candidates[0]?.text ?? null,
+    designation: candidates[1]?.text ?? null,
+    company:     candidates[2]?.text ?? null,
+  };
+}
+
+// Keep old name exported for any internal callers that just need the name
+function getCurrentProfileName(elements) {
+  return getCurrentProfileInfo(elements).name;
 }
 
 /**
@@ -512,7 +551,7 @@ function findConnectButtonBounds(elements) {
 async function readProfileState(driver) {
   const xml      = await driver.getPageSource();
   const elements = parseSource(xml);
-  const name     = getCurrentProfileName(elements);
+  const { name, designation, company } = getCurrentProfileInfo(elements);
 
   function hasRealBoundsText(target) {
     for (const el of elements) {
@@ -524,12 +563,12 @@ async function readProfileState(driver) {
     return false;
   }
 
-  const isPending    = hasRealBoundsText('Pending');
-  const isConnected  = hasRealBoundsText('Connected') || hasRealBoundsText('Qualify your connection');
+  const isPending   = hasRealBoundsText('Pending');
+  const isConnected = hasRealBoundsText('Connected') || hasRealBoundsText('Qualify your connection');
 
   const connectR = isConnected ? null : findConnectButtonBounds(elements);
   return {
-    name,
+    name, designation, company,
     isPending,
     isConnected,
     hasConnectButton: !!connectR,
@@ -635,11 +674,28 @@ async function sendConnectionMessage(driver, firstName) {
   throw new Error('RATE_LIMITED');
 }
 
-// ── Sound alert ───────────────────────────────────────────────────────────────
+// ── Sound alerts ─────────────────────────────────────────────────────────────
 
 function playSound() {
   const f = path.join(__dirname, 'alert.wav');
   if (fs.existsSync(f)) spawnSync('afplay', [f], { timeout: 10000 });
+}
+
+/** Distinct repeating alert used in --data mode when pager is exhausted. */
+function playPagerAlert() {
+  const custom = path.join(__dirname, 'alert.wav');
+  const sound  = fs.existsSync(custom) ? custom : '/System/Library/Sounds/Glass.aiff';
+  for (let i = 0; i < 4; i++) {
+    spawnSync('afplay', [sound], { timeout: 5000 });
+  }
+}
+
+/** Pause execution until the user presses Enter in the terminal. */
+function waitForEnter(prompt) {
+  return new Promise(resolve => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    rl.question(prompt, () => { rl.close(); resolve(); });
+  });
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -653,6 +709,7 @@ async function main() {
   console.log('┌──────────────────────────────────────────────────────┐');
   console.log('│  ATx Enterprise 2026 — Attendee Connector            │');
   console.log('└──────────────────────────────────────────────────────┘');
+  console.log(`  Mode        : ${DATA_MODE ? '--data (scrape all + connect, human navigation)' : 'normal (auto navigation)'}`);
   console.log(`  Device      : ${cfg.device.name}`);
   console.log(`  Package     : ${cfg.device.appPackage}`);
   console.log(`  Output      : ${path.resolve(OUT_DIR)}`);
@@ -711,7 +768,13 @@ async function main() {
 
       // ── Phase 1: Scroll list to find the next unprocessed card ────────────
       console.log(`\n[Batch ${batch}] Scanning list for next unprocessed person…`);
-      if (lastSwipedName) {
+
+      // DATA mode always starts from the very top of the list (first item).
+      if (DATA_MODE) {
+        console.log('  Scrolling list to top…');
+        await scrollListToTop(driver);
+        lastSwipedName = null; // ignore any saved anchor
+      } else if (lastSwipedName) {
         console.log(`  Resuming after "${lastSwipedName}"…`);
       }
 
@@ -814,39 +877,76 @@ async function main() {
           await sleep(600);
           state = await readProfileState(driver);
         }
-        const { name, isPending, isConnected, hasConnectButton, connectCenter } = state;
+        const { name, designation, company, isPending, isConnected, hasConnectButton, connectCenter } = state;
 
-        // End-of-pager: same profile stuck N times — break to list for next batch
+        // End-of-pager: same profile stuck N times
         if (name && name === prevName) {
           swipeMisses++;
           console.log(`  (same profile "${name}" — miss ${swipeMisses}/${cfg.maxSwipeMisses})`);
           if (swipeMisses >= cfg.maxSwipeMisses) {
-            lastSwipedName = name; // remember where the pager stalled
-            console.log(`\n  Pager limit reached at "${name}". Returning to list for batch ${batch + 1}…`);
-            break; // exits swipe loop only — outer loop continues
+            lastSwipedName = name;
+            if (DATA_MODE) {
+              // ── DATA mode: alert + wait for human to navigate manually ──────
+              playPagerAlert();
+              console.log('\n  ══════════════════════════════════════════════════════');
+              console.log(`  Pager limit reached at "${name}".`);
+              console.log('  In the app, go back to the attendees list and open');
+              console.log('  the NEXT person\'s profile card manually.');
+              console.log('  ══════════════════════════════════════════════════════');
+              await waitForEnter('  Press Enter when the next profile is open… ');
+              swipeMisses = 0;
+              prevName    = null;
+              currentCard = { name: null, designation: null, company: null, center: entryCard.center };
+              continue; // resume swiping from wherever human landed
+            } else {
+              console.log(`\n  Pager limit reached at "${name}". Returning to list for batch ${batch + 1}…`);
+              break; // exits swipe loop — outer loop auto-navigates
+            }
           }
           await swipeToNextProfile(driver);
           continue;
         }
         swipeMisses = 0;
 
-        // Keep currentCard in sync with what's on screen
-        if (name && currentCard.name !== name) {
-          currentCard = { name, designation: null, company: null, center: currentCard.center };
+        // Sync currentCard: use live profile data (name + designation + company from page)
+        if (name) {
+          currentCard = {
+            name,
+            designation: designation || currentCard.designation,
+            company:     company     || currentCard.company,
+            center:      currentCard.center,
+          };
         }
         prevName = name || prevName;
 
         const profileId   = makeProfileId(currentCard.name, currentCard.designation, currentCard.company);
         const displayName = currentCard.name || '(unknown)';
 
-        // Already processed? (check composite key + name fallback)
+        // Already processed? (composite key + name fallback)
         if (isAlreadyProcessed(profiles, processedNames, currentCard.name, currentCard.designation, currentCard.company)) {
           console.log(`  [skip] "${displayName}" — already processed`);
           await swipeToNextProfile(driver);
           continue;
         }
 
-        // No connect button → pending / connected / qualify panel — swipe immediately
+        // ── Scrape extras ──────────────────────────────────────────────────
+        // DATA mode: scrape everyone (pending/connected included).
+        // Normal mode: only scrape when the connect button is present.
+        let extras = { contact: [], socialMedia: [] };
+        const shouldScrape = DATA_MODE || hasConnectButton;
+        if (shouldScrape) {
+          try {
+            extras = await scrapeProfileExtras(driver);
+            const parts = [];
+            if (extras.contact.length)     parts.push(`${extras.contact.length} contact(s)`);
+            if (extras.socialMedia.length) parts.push(extras.socialMedia.join(', '));
+            if (parts.length) console.log(`    extras: ${parts.join('  |  ')}`);
+          } catch (e) {
+            console.warn(`    (scrape extras failed: ${e.message})`);
+          }
+        }
+
+        // No connect button → pending / connected / qualify panel
         if (!hasConnectButton) {
           const reason = isPending ? 'pending' : 'already connected';
           console.log(`  [skip] "${displayName}" — ${reason}`);
@@ -855,23 +955,13 @@ async function main() {
             designation: currentCard.designation,
             company:     currentCard.company,
             status:      isPending ? 'pending' : 'connected',
+            contact:     extras.contact,
+            socialMedia: extras.socialMedia,
           });
           saveProfiles(profiles);
           writeCSV(profiles);
           await swipeToNextProfile(driver);
           continue;
-        }
-
-        // ── Scrape contact + social links (only when connect button present) ─
-        let extras = { contact: [], socialMedia: [] };
-        try {
-          extras = await scrapeProfileExtras(driver);
-          const parts = [];
-          if (extras.contact.length)     parts.push(`${extras.contact.length} contact(s)`);
-          if (extras.socialMedia.length) parts.push(extras.socialMedia.join(', '));
-          if (parts.length) console.log(`    extras: ${parts.join('  |  ')}`);
-        } catch (e) {
-          console.warn(`    (scrape extras failed: ${e.message})`);
         }
 
         // Rate-limited — save data, defer connection, swipe
@@ -932,6 +1022,8 @@ async function main() {
               designation: currentCard.designation,
               company:     currentCard.company,
               status:      'connected',
+              contact:     extras.contact,
+              socialMedia: extras.socialMedia,
             });
             saveProfiles(profiles);
             writeCSV(profiles);
@@ -947,12 +1039,16 @@ async function main() {
         }
       } // end swipe loop
 
-      // Pager exhausted — press back to return to the attendee list
+      if (DATA_MODE) {
+        // In --data mode the human navigates manually — no auto list return
+        break; // exit outer batch loop after human finishes
+      }
+
+      // Normal mode: press back to return to list for next batch
       console.log('  Pressing back to attendee list…');
       try { await driver.back(); } catch {}
       await sleep(cfg.timing.afterScroll);
       await waitForList(driver);
-      // outer batch loop continues from here
 
     } // end outer batch loop
 

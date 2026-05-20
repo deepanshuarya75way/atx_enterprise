@@ -779,30 +779,22 @@ async function main() {
     while (true) {
       batch++;
 
-      // ── Phase 1: Scroll list to find the next unprocessed card ────────────
-      console.log(`\n[Batch ${batch}] Scanning list for next unprocessed person…`);
-
-      // DATA mode always starts from the very top of the list (first item).
-      if (DATA_MODE) {
-        console.log('  Scrolling list to top…');
-        await scrollListToTop(driver);
-        lastSwipedName = null; // ignore any saved anchor
-      } else if (lastSwipedName) {
-        console.log(`  Resuming after "${lastSwipedName}"…`);
-      }
-
       const processedNames = buildProcessedNameSet(profiles);
-
-      let entryCard    = null;
-      let staleScrolls = 0;
+      let entryCard = null;
 
       if (DATA_MODE) {
-        // ── DATA mode: just tap the first card at the top — visit everyone ──
-        const cards = await scanList(driver);
-        entryCard = cards[0] || null;
-        if (entryCard) console.log(`  → Starting from: "${entryCard.name}"\n`);
+        // ── DATA mode: profile is already open — skip list scan and tap ──────
+        console.log(`\n[Batch ${batch}] Starting from currently open profile…`);
+        entryCard = { name: null, designation: null, company: null, center: { x: 360, y: 800 } };
       } else {
-        // ── Normal mode: scroll to find first unprocessed card ──────────────
+        // ── Phase 1: Scroll list to find the next unprocessed card ──────────
+        console.log(`\n[Batch ${batch}] Scanning list for next unprocessed person…`);
+
+        if (lastSwipedName) {
+          console.log(`  Resuming after "${lastSwipedName}"…`);
+        }
+
+        let staleScrolls = 0;
         // When lastSwipedName is set we must scroll the list until that person
         // is visible, then look for unprocessed cards that appear AFTER them.
         // seenAnchor flips to true once we have scrolled to / past the anchor.
@@ -861,30 +853,30 @@ async function main() {
             staleScrolls = 0;
           }
         }
-      }
 
-      if (!entryCard) {
-        console.log('All attendees have been processed!');
-        break; // exit outer batch loop — we are done
-      }
+        if (!entryCard) {
+          console.log('All attendees have been processed!');
+          break; // exit outer batch loop — we are done
+        }
 
-      // ── Phase 2: Tap the entry card to open the profile pager ─────────────
-      console.log(`  Opening profile for "${entryCard.name}"…`);
-      await tapAt(driver, entryCard.center.x, entryCard.center.y);
-      await sleep(cfg.timing.afterTap);
+        // ── Phase 2: Tap the entry card to open the profile pager ───────────
+        console.log(`  Opening profile for "${entryCard.name}"…`);
+        await tapAt(driver, entryCard.center.x, entryCard.center.y);
+        await sleep(cfg.timing.afterTap);
 
-      const profileReady = await waitForEl(
-        driver,
-        '//android.widget.TextView[@text="Book a meeting"]',
-        cfg.timing.profileTimeout,
-      );
-      if (!profileReady) {
-        console.error('  Profile page did not load — returning to list.');
-        try { await driver.back(); } catch {}
-        await sleep(cfg.timing.afterScroll);
-        continue; // retry outer batch loop
+        const profileReady = await waitForEl(
+          driver,
+          '//android.widget.TextView[@text="Book a meeting"]',
+          cfg.timing.profileTimeout,
+        );
+        if (!profileReady) {
+          console.error('  Profile page did not load — returning to list.');
+          try { await driver.back(); } catch {}
+          await sleep(cfg.timing.afterScroll);
+          continue; // retry outer batch loop
+        }
+        console.log('  Profile view open.\n');
       }
-      console.log('  Profile view open.\n');
 
       // ── Phase 3: Swipe-based processing loop (one pager batch ~40 cards) ──
       let currentCard = entryCard;

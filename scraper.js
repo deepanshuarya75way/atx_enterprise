@@ -521,31 +521,44 @@ function getCurrentProfileName(elements) {
 
 /**
  * Checks whether the connect button is visible on the current profile.
- * The circular connect button (person+ icon) sits to the right of "Book a meeting"
- * at a consistent position: Button bounds ~[544,679][656,791].
  *
- * We look for a clickable Button (or View) whose bounds x1 is between 520–580
- * and y1 is between 640–720, with size ~100×100 px.
+ * New layout: a full-width clickable container (node) at y≈679–791 that
+ * contains a "Connect" TextView label inside it.
+ *
+ * Strategy:
+ *   1. Find the "Connect" TextView with real bounds in the button area (y 600–900).
+ *   2. Find the smallest clickable container that encloses that text — this is the
+ *      button to tap.
+ *   3. Fall back to tapping the text bounds directly if no container is found.
  */
 function findConnectButtonBounds(elements) {
+  // 1. Locate the "Connect" label with real bounds
+  let connectText = null;
   for (const el of elements) {
-    if (!['android.widget.Button', 'android.view.View'].includes(el._tag)) continue;
+    if (!el._tag.includes('TextView')) continue;
+    if ((el.text || '').trim() !== 'Connect') continue;
+    const b = parseBoundsRect(el.bounds);
+    if (!b || (b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) continue;
+    if (b.y1 < 600 || b.y1 > 900) continue;
+    connectText = b;
+    break;
+  }
+  if (!connectText) return null;
+
+  // 2. Find the smallest clickable container that encloses the label
+  let best = null;
+  let bestArea = Infinity;
+  for (const el of elements) {
     if (el.clickable !== 'true') continue;
     const r = parseBoundsRect(el.bounds);
-    if (!r) continue;
-    const w = r.x2 - r.x1;
-    const h = r.y2 - r.y1;
-    // Circular button: ~80–140 px wide/tall, to the right of center
-    if (w < 60 || w > 160 || h < 60 || h > 160) continue;
-    if (r.x1 < 500 || r.x1 > 620) continue;
-    if (r.y1 < 600 || r.y1 > 800) continue;
-    // No text / no desc (it's an icon button)
-    const t = (el.text || '').trim();
-    const d = (el['content-desc'] || '').trim();
-    if (t || d) continue;
-    return r;
+    if (!r || (r.x1 === 0 && r.y1 === 0 && r.x2 === 0 && r.y2 === 0)) continue;
+    if (r.x1 > connectText.x1 || r.x2 < connectText.x2) continue;
+    if (r.y1 > connectText.y1 || r.y2 < connectText.y2) continue;
+    const area = (r.x2 - r.x1) * (r.y2 - r.y1);
+    if (area < bestArea) { best = r; bestArea = area; }
   }
-  return null;
+
+  return best || connectText; // fallback: tap the text itself
 }
 
 /**

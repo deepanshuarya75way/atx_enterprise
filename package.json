@@ -7,6 +7,7 @@
     "start": "node scraper.js"
   },
   "dependencies": {
+    "exceljs": "^4.4.0",
     "webdriverio": "^8.39.0"
   }
 }

@@ -26,9 +26,10 @@
 const { remote } = require('webdriverio');
 const { spawnSync } = require('child_process');
 const readline = require('readline');
-const fs   = require('fs');
-const path = require('path');
-const cfg  = require('./config');
+const fs      = require('fs');
+const path    = require('path');
+const ExcelJS = require('exceljs');
+const cfg     = require('./config');
 
 // ── Run mode ──────────────────────────────────────────────────────────────────
 // --data  Scrape contact/social for ALL profiles (including pending/connected)
@@ -39,10 +40,10 @@ const DATA_MODE = process.argv.includes('--data');
 
 const OUT_DIR      = cfg.outputDir;
 const VISITED_FILE = path.join(OUT_DIR, 'visited.json');
-const CSV_FILE     = path.join(OUT_DIR, 'profiles.csv');
+const XLSX_FILE    = path.join(OUT_DIR, 'profiles.xlsx');
 const RATE_FILE    = path.join(OUT_DIR, 'rate_limit.json');
 
-const CSV_COLS = ['profileId', 'name', 'designation', 'company', 'status', 'contact', 'socialMedia', 'processedAt'];
+const XLSX_COLS = ['profileId', 'name', 'designation', 'company', 'status', 'contact', 'socialMedia', 'processedAt'];
 
 const RATE_SEQUENCE_MS = [30 * 60 * 1000, 10 * 60 * 1000, 5 * 60 * 1000];
 
@@ -124,18 +125,38 @@ function saveProfiles(map) {
   }, null, 2));
 }
 
-function escapeCSV(val) {
+function cellValue(val) {
   if (val == null) return '';
-  const s = (Array.isArray(val) ? val.join('; ') : String(val)).replace(/\r?\n/g, ' ');
-  return (s.includes(',') || s.includes('"')) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  return Array.isArray(val) ? val.join('; ') : String(val);
 }
 
-function writeCSV(map) {
-  const lines = [CSV_COLS.join(',')];
-  for (const p of map.values()) {
-    lines.push(CSV_COLS.map(c => escapeCSV(p[c])).join(','));
+async function writeXLSX(map) {
+  const sheetName = new Date().toISOString().slice(0, 10); // e.g. "2026-05-20"
+
+  const wb = new ExcelJS.Workbook();
+  // Load existing file so we preserve other days' sheets
+  if (fs.existsSync(XLSX_FILE)) {
+    try { await wb.xlsx.readFile(XLSX_FILE); } catch {}
   }
-  fs.writeFileSync(CSV_FILE, lines.join('\n') + '\n', 'utf8');
+
+  // Remove today's sheet if it exists (will be rewritten with latest data)
+  const existing = wb.getWorksheet(sheetName);
+  if (existing) wb.removeWorksheet(existing.id);
+
+  const ws = wb.addWorksheet(sheetName);
+
+  // Header row
+  ws.addRow(XLSX_COLS);
+  ws.getRow(1).font = { bold: true };
+
+  // Data rows — only today's records (processedAt starts with today's date)
+  for (const p of map.values()) {
+    if (!p.processedAt || !p.processedAt.startsWith(sheetName)) continue;
+    ws.addRow(XLSX_COLS.map(c => cellValue(p[c])));
+  }
+
+  ws.columns.forEach(col => { col.width = 24; });
+  await wb.xlsx.writeFile(XLSX_FILE);
 }
 
 function upsertProfile(map, profileId, patch) {
@@ -756,7 +777,7 @@ async function main() {
   const shutdown = async (sig) => {
     console.log(`\nStopped (${sig}).  Sent this run: ${sentThisRun}`);
     saveProfiles(profiles);
-    writeCSV(profiles);
+    await writeXLSX(profiles);
     if (driver) try { await driver.deleteSession(); } catch {}
     playSound();
     process.exit(0);
@@ -992,7 +1013,7 @@ async function main() {
             socialMedia: extras.socialMedia.length ? extras.socialMedia : (profiles.get(profileId)?.socialMedia || []),
           });
           saveProfiles(profiles);
-          writeCSV(profiles);
+          await writeXLSX(profiles);
           await swipeToNextProfile(driver);
           continue;
         }
@@ -1010,7 +1031,7 @@ async function main() {
             socialMedia: extras.socialMedia,
           });
           saveProfiles(profiles);
-          writeCSV(profiles);
+          await writeXLSX(profiles);
           await swipeToNextProfile(driver);
           continue;
         }
@@ -1035,7 +1056,7 @@ async function main() {
             socialMedia: extras.socialMedia,
           });
           saveProfiles(profiles);
-          writeCSV(profiles);
+          await writeXLSX(profiles);
           console.log(`    ✓ sent  (total this run: ${sentThisRun})`);
 
           await sleep(cfg.timing.settle * 3);
@@ -1059,7 +1080,7 @@ async function main() {
               socialMedia: extras.socialMedia,
             });
             saveProfiles(profiles);
-            writeCSV(profiles);
+            await writeXLSX(profiles);
             try { await driver.back(); } catch {}
             await sleep(cfg.timing.settle);
             await swipeToNextProfile(driver);
@@ -1087,11 +1108,11 @@ async function main() {
 
   } finally {
     saveProfiles(profiles);
-    writeCSV(profiles);
+    await writeXLSX(profiles);
     const totalSent = Array.from(profiles.values()).filter(p => p.status === 'sent').length;
     console.log(`\n✓ Done. Sent this run: ${sentThisRun}  |  Total sent: ${totalSent}  |  In DB: ${profiles.size}`);
     console.log(`  JSON : ${path.resolve(VISITED_FILE)}`);
-    console.log(`  CSV  : ${path.resolve(CSV_FILE)}`);
+    console.log(`  XLSX : ${path.resolve(XLSX_FILE)}`);
     if (driver) await driver.deleteSession();
     playSound();
   }

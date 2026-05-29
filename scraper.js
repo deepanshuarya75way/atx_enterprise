@@ -528,16 +528,28 @@ function getCurrentProfileInfo(elements) {
     candidates.push({ text: t, y: b.y1 });
   }
   candidates.sort((a, b) => a.y - b.y);
+
+  // Layout is always: name (top) → designation(s) (middle) → company (bottom).
+  // When 4+ fields appear (e.g. two role lines), taking candidates[2] as company
+  // picks up the wrong field.  Instead: first=name, last=company, middle=designation.
+  const n = candidates.length;
   return {
-    name:        candidates[0]?.text ?? null,
-    designation: candidates[1]?.text ?? null,
-    company:     candidates[2]?.text ?? null,
+    name:        n >= 1 ? candidates[0].text : null,
+    designation: n >= 3 ? candidates.slice(1, n - 1).map(c => c.text).join(', ')
+                        : (n === 2 ? null : null),   // 2 fields = name + company only
+    company:     n >= 2 ? candidates[n - 1].text : null,
   };
 }
 
 // Keep old name exported for any internal callers that just need the name
 function getCurrentProfileName(elements) {
   return getCurrentProfileInfo(elements).name;
+}
+
+/** Format a profile for terminal output: "Name" [Designation @ Company] */
+function fmtProfile(name, designation, company) {
+  const meta = [designation, company].filter(Boolean).join(' @ ');
+  return meta ? `"${name}" [${meta}]` : `"${name}"`;
 }
 
 /**
@@ -968,11 +980,12 @@ async function main() {
 
         const profileId   = makeProfileId(currentCard.name, currentCard.designation, currentCard.company);
         const displayName = currentCard.name || '(unknown)';
+        const displayFull = fmtProfile(displayName, currentCard.designation, currentCard.company);
 
         // Already processed? Skip in normal mode only.
         // In --data mode we visit every profile to fill in missing data.
         if (!DATA_MODE && isAlreadyProcessed(profiles, processedNames, currentCard.name, currentCard.designation, currentCard.company)) {
-          console.log(`  [skip] "${displayName}" — already processed`);
+          console.log(`  [skip] ${displayFull} — already processed`);
           await swipeToNextProfile(driver);
           continue;
         }
@@ -998,7 +1011,7 @@ async function main() {
         if (!hasConnectButton) {
           const reason = isPending ? 'pending' : 'already connected';
           const label  = DATA_MODE ? '[data]' : '[skip]';
-          console.log(`  ${label} "${displayName}" — ${reason}`);
+          console.log(`  ${label} ${displayFull} — ${reason}`);
           // Preserve terminal status already in DB (e.g. 'sent' → don't overwrite to 'pending')
           const existingStatus = profiles.get(profileId)?.status;
           const newStatus = TERMINAL_STATUSES.has(existingStatus)
@@ -1021,7 +1034,7 @@ async function main() {
         // Rate-limited — save data, defer connection, swipe
         if (isRateLimited()) {
           const resumeAt = rateLimitResumesAt();
-          console.log(`  [wait] "${displayName}" — rate-limited until ${resumeAt.toLocaleTimeString()}`);
+          console.log(`  [wait] ${displayFull} — rate-limited until ${resumeAt.toLocaleTimeString()}`);
           upsertProfile(profiles, profileId, {
             name:        currentCard.name,
             designation: currentCard.designation,
@@ -1038,7 +1051,7 @@ async function main() {
 
         // ── Attempt to connect ─────────────────────────────────────────────
         const firstName = displayName.split(' ')[0];
-        console.log(`[→] "${displayName}"  (connecting as "${firstName}"…)`);
+        console.log(`[→] ${displayFull}  (connecting as "${firstName}"…)`);
 
         try {
           await tapAt(driver, connectCenter.x, connectCenter.y);
@@ -1070,7 +1083,7 @@ async function main() {
             await sleep(cfg.timing.settle);
             await swipeToNextProfile(driver);
           } else if (err.message === 'QUALIFY_CONNECTION') {
-            console.log(`  [skip] "${displayName}" — qualify connection prompt (already connected)`);
+            console.log(`  [skip] ${displayFull} — qualify connection prompt (already connected)`);
             upsertProfile(profiles, profileId, {
               name:        currentCard.name,
               designation: currentCard.designation,

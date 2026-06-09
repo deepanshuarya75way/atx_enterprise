@@ -34,13 +34,21 @@ fi
 # Usage:
 #   ./run.sh          — normal mode (auto list navigation, connect only)
 #   ./run.sh --data   — data mode   (scrape all + connect, human navigation at pager end)
+#   ./run.sh --cf     — connect-find mode (search aa→zz, connect new people, export CSV)
 
 MODE=""
+CF_MODE=false
 for arg in "$@"; do
   case "$arg" in
     --data) MODE="--data" ;;
+    --cf)   CF_MODE=true  ;;
   esac
 done
 
-echo "Starting ATx Enterprise 2026 Connector${MODE:+ ($MODE)}..."
-node scraper.js $MODE
+if [ "$CF_MODE" = true ]; then
+  echo "Starting ATx Enterprise 2026 Connector (--cf / Connect-Find mode)..."
+  node cf_scraper.js
+else
+  echo "Starting ATx Enterprise 2026 Connector${MODE:+ ($MODE)}..."
+  node scraper.js $MODE
+fi

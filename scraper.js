@@ -35,13 +35,19 @@ const cfg     = require('./config');
 // --data  Scrape contact/social for ALL profiles (including pending/connected)
 //         AND send connections.  When the pager exhausts, play an alert and
 //         wait for the human to open the next card manually, then press Enter.
+// --cf    Contact-Find mode: iterate all 2-letter search terms (AA→ZZ), send
+//         connection to every unseen attendee, write results to per-day CSV.
 const DATA_MODE = process.argv.includes('--data');
-
+const CF_MODE   = process.argv.includes('--cf');
 
 const OUT_DIR      = cfg.outputDir;
 const VISITED_FILE = path.join(OUT_DIR, 'visited.json');
 const XLSX_FILE    = path.join(OUT_DIR, 'profiles.xlsx');
 const RATE_FILE    = path.join(OUT_DIR, 'rate_limit.json');
+
+// CF-mode specific paths
+const CF_STATE_FILE = path.join(OUT_DIR, 'cf_state.json');
+const CF_CSV_DIR    = path.join(OUT_DIR, 'cf');
 
 const XLSX_COLS = ['profileId', 'name', 'designation', 'company', 'status', 'contact', 'socialMedia', 'processedAt'];
 
@@ -757,6 +763,367 @@ function waitForEnter(prompt) {
   });
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ── CF MODE (--cf) ────────────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Generate all 2-letter search terms in lexicographic order: AA, AB … AZ, BA … ZZ.
+ * 676 terms total. Each term is typed into the app's search box to produce a
+ * filtered attendee list; we process every person in those results.
+ */
+function generateCFTerms() {
+  const terms = [];
+  const alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+  for (const a of alpha) for (const b of alpha) terms.push(a + b);
+  return terms;
+}
+
+// ── CF state ──────────────────────────────────────────────────────────────────
+
+function loadCFState() {
+  try {
+    if (fs.existsSync(CF_STATE_FILE))
+      return JSON.parse(fs.readFileSync(CF_STATE_FILE, 'utf8'));
+  } catch {}
+  return { currentTermIndex: 0, terms: {} };
+}
+
+function saveCFState(state) {
+  ensureDir(OUT_DIR);
+  fs.writeFileSync(CF_STATE_FILE, JSON.stringify(state, null, 2));
+}
+
+// ── CF CSV (append-only, date-wise) ───────────────────────────────────────────
+
+const CF_CSV_COLS = [
+  'name', 'designation', 'company', 'status',
+  'searchTerm', 'contact', 'socialMedia', 'profileId', 'processedAt',
+];
+
+function escapeCFCSV(val) {
+  if (val == null) return '';
+  const s = Array.isArray(val) ? val.join('; ')
+                               : String(val).replace(/\r?\n/g, ' ');
+  return (s.includes(',') || s.includes('"'))
+    ? '"' + s.replace(/"/g, '""') + '"'
+    : s;
+}
+
+/**
+ * Append ONE profile row to today's CF CSV.
+ * Creates the file + header on first write; only appends on subsequent calls.
+ * Old files are NEVER touched — each calendar day has its own file.
+ */
+function appendCFCSVRow(profile, searchTerm) {
+  ensureDir(CF_CSV_DIR);
+  const today   = new Date().toISOString().slice(0, 10);
+  const csvFile = path.join(CF_CSV_DIR, `${today}.csv`);
+  const row = CF_CSV_COLS.map(c =>
+    c === 'searchTerm' ? escapeCFCSV(searchTerm) : escapeCFCSV(profile[c])
+  ).join(',');
+  if (!fs.existsSync(csvFile)) {
+    fs.writeFileSync(csvFile, CF_CSV_COLS.join(',') + '\n' + row + '\n', 'utf8');
+  } else {
+    fs.appendFileSync(csvFile, row + '\n', 'utf8');
+  }
+}
+
+// ── CF "is done?" helper ──────────────────────────────────────────────────────
+
+/**
+ * Returns true only when the person already has a terminal status (sent /
+ * connected / pending).  Rate-limit skips and errors are retried.
+ */
+function isCFDone(profiles, processedNames, name, designation, company) {
+  const pid      = makeProfileId(name, designation, company);
+  const existing = profiles.get(pid);
+  if (existing && TERMINAL_STATUSES.has(existing.status)) return true;
+  return processedNames.has((name || '').trim().toLowerCase());
+}
+
+// ── CF search helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Type `term` into the search EditText and wait for results to load.
+ * Retries up to 3 times if the field isn't immediately found.
+ */
+async function performCFSearch(driver, term) {
+  let editText = null;
+  for (let attempt = 0; attempt < 3 && !editText; attempt++) {
+    editText = await waitForEl(driver, '//android.widget.EditText', 2500);
+    if (!editText) await sleep(600);
+  }
+  if (!editText) throw new Error('CF: search EditText not found');
+
+  await editText.clearValue();
+  await sleep(250);
+  await editText.setValue(term);
+  await sleep(2200); // wait for search results to settle
+}
+
+/**
+ * Returns true when the search result shows "No item available" (or variant).
+ */
+async function isCFNoResults(driver) {
+  const xml = await driver.getPageSource();
+  const low = xml.toLowerCase();
+  return low.includes('no item available') ||
+         low.includes('no items available') ||
+         low.includes('no result');
+}
+
+/**
+ * After going back from a profile the app usually preserves the search query.
+ * But if it was cleared, re-apply it.
+ */
+async function ensureCFSearchActive(driver, term) {
+  try {
+    const xml  = await driver.getPageSource();
+    const els  = parseSource(xml);
+    const edit = els.find(e => e._tag === 'android.widget.EditText');
+    if (!edit) { await sleep(500); return; }
+    const cur  = (edit.text || '').trim().toUpperCase();
+    if (cur !== term.toUpperCase()) await performCFSearch(driver, term);
+  } catch { await performCFSearch(driver, term); }
+}
+
+// ── CF single-profile processor ───────────────────────────────────────────────
+
+/**
+ * Open `card`, connect (or record state), go back.
+ * Returns 'sent' | 'skipped' | 'error'.
+ */
+async function processCFProfile(driver, card, profiles, sentRef, term, cfState) {
+  const profileId  = makeProfileId(card.name, card.designation, card.company);
+  const displayStr = fmtProfile(card.name, card.designation, card.company);
+
+  await tapAt(driver, card.center.x, card.center.y);
+  await sleep(cfg.timing.afterTap);
+
+  const profileReady = await waitForEl(
+    driver,
+    '//android.widget.TextView[@text="Book a meeting"]',
+    cfg.timing.profileTimeout,
+  );
+  if (!profileReady) {
+    console.warn(`    ⚠ Profile did not load for ${displayStr} — skipping`);
+    playSound();
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.afterScroll);
+    return 'error';
+  }
+
+  const state      = await readProfileState(driver);
+  const finalName  = state.name  || card.name;
+  const finalDesig = state.designation || card.designation;
+  const finalCo    = state.company     || card.company;
+  const firstName  = finalName.split(' ')[0];
+
+  // ── Already connected / pending ────────────────────────────────────────────
+  if (state.isConnected || state.isPending) {
+    const st = state.isConnected ? 'connected' : 'pending';
+    console.log(`  [skip] ${displayStr} — ${st}`);
+    const p = upsertProfile(profiles, profileId, {
+      name: finalName, designation: finalDesig, company: finalCo,
+      status: st, contact: [], socialMedia: [],
+    });
+    appendCFCSVRow({ ...p, searchTerm: term }, term);
+    saveProfiles(profiles);
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.afterScroll);
+    return 'skipped';
+  }
+
+  // ── Rate-limited — save as deferred ───────────────────────────────────────
+  if (isRateLimited()) {
+    const resumeAt = rateLimitResumesAt();
+    console.log(`  [wait] ${displayStr} — rate-limited until ${resumeAt.toLocaleTimeString()}`);
+    upsertProfile(profiles, profileId, {
+      name: finalName, designation: finalDesig, company: finalCo,
+      status: 'skipped_rate_limit', contact: [], socialMedia: [],
+    });
+    saveProfiles(profiles);
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.afterScroll);
+    return 'skipped';
+  }
+
+  // ── No connect button ──────────────────────────────────────────────────────
+  if (!state.hasConnectButton) {
+    console.log(`  [?] ${displayStr} — no connect button`);
+    upsertProfile(profiles, profileId, {
+      name: finalName, designation: finalDesig, company: finalCo,
+      status: 'no_button', contact: [], socialMedia: [],
+    });
+    saveProfiles(profiles);
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.afterScroll);
+    return 'skipped';
+  }
+
+  // ── Scrape extras then connect ─────────────────────────────────────────────
+  let extras = { contact: [], socialMedia: [] };
+  try { extras = await scrapeProfileExtras(driver); } catch {}
+
+  console.log(`[→] ${displayStr}  (sending as "${firstName}"…)`);
+
+  try {
+    await tapAt(driver, state.connectCenter.x, state.connectCenter.y);
+    await sleep(cfg.timing.afterConnect);
+    await sendConnectionMessage(driver, firstName);
+
+    sentRef.count++;
+    const p = upsertProfile(profiles, profileId, {
+      name: finalName, designation: finalDesig, company: finalCo,
+      status: 'sent', contact: extras.contact, socialMedia: extras.socialMedia,
+    });
+    appendCFCSVRow({ ...p, searchTerm: term }, term);
+    saveProfiles(profiles);
+    console.log(`    ✓ sent  (run total: ${sentRef.count})`);
+
+    // Update CF state count for this term
+    cfState.terms[term].count = (cfState.terms[term].count || 0) + 1;
+    cfState.terms[term].lastProfileName = finalName;
+    saveCFState(cfState);
+
+    await sleep(cfg.timing.settle * 3);
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.afterScroll);
+    return 'sent';
+
+  } catch (err) {
+    if (err.message === 'RATE_LIMITED') {
+      const { resumeAt, waitMinutes } = setRateLimited();
+      console.warn(`    ⚠ Rate-limited — ${waitMinutes} min (until ${resumeAt.toLocaleTimeString()})`);
+      playSound();
+    } else if (err.message === 'QUALIFY_CONNECTION') {
+      console.log(`  [skip] ${displayStr} — qualify connection (already connected)`);
+      const p = upsertProfile(profiles, profileId, {
+        name: finalName, designation: finalDesig, company: finalCo,
+        status: 'connected', contact: extras.contact, socialMedia: extras.socialMedia,
+      });
+      appendCFCSVRow({ ...p, searchTerm: term }, term);
+      saveProfiles(profiles);
+    } else {
+      console.error(`    ✗ Error: ${err.message}`);
+      playSound();
+    }
+    try { await driver.back(); } catch {}
+    await sleep(cfg.timing.settle * 2);
+    return 'error';
+  }
+}
+
+// ── CF main loop ──────────────────────────────────────────────────────────────
+
+async function runCFMode(driver, profiles, sentRef) {
+  const terms    = generateCFTerms();
+  const cfState  = loadCFState();
+  const startIdx = cfState.currentTermIndex || 0;
+
+  console.log(`\nCF Mode: ${terms.length} terms total`);
+  console.log(`  Resuming from index ${startIdx} → term "${terms[startIdx] || '(done)'}"`)
+  console.log(`  CF CSV dir : ${path.resolve(CF_CSV_DIR)}\n`);
+
+  for (let termIdx = startIdx; termIdx < terms.length; termIdx++) {
+    const term = terms[termIdx];
+
+    // Persist current position so a crash resumes here
+    cfState.currentTermIndex = termIdx;
+    if (!cfState.terms[term]) cfState.terms[term] = { count: 0, status: 'pending' };
+    cfState.terms[term].status = 'in_progress';
+    saveCFState(cfState);
+
+    process.stdout.write(`\n[${String(termIdx + 1).padStart(3)}/${terms.length}] "${term}" … `);
+
+    // ── Apply search ────────────────────────────────────────────────────────
+    try {
+      await performCFSearch(driver, term);
+    } catch (e) {
+      console.error(`\n  Search failed: ${e.message}`);
+      playSound();
+      cfState.terms[term].status = 'error';
+      saveCFState(cfState);
+      continue;
+    }
+
+    // ── No results? ─────────────────────────────────────────────────────────
+    if (await isCFNoResults(driver)) {
+      process.stdout.write('no results\n');
+      cfState.terms[term] = {
+        count: 0, status: 'empty',
+        completedAt: new Date().toISOString(),
+      };
+      cfState.currentTermIndex = termIdx + 1;
+      saveCFState(cfState);
+      continue;
+    }
+
+    // ── Scroll to top then process all results ──────────────────────────────
+    await scrollListToTop(driver);
+    const processedNames = buildProcessedNameSet(profiles);
+
+    // termSeen tracks lower-case names we already opened in this term's pass.
+    // After going back from a profile the list may reset to the top — termSeen
+    // prevents re-opening cards we already handled.
+    const termSeen   = new Set();
+    let staleScrolls = 0;
+    let termNewConns = 0;
+
+    process.stdout.write('\n');
+
+    while (staleScrolls <= cfg.maxStaleScrolls) {
+      const cards = await scanList(driver);
+
+      // Find the first card in the current viewport we haven't opened yet
+      const target = cards.find(c => {
+        if (!c.name) return false;
+        const nameKey = c.name.trim().toLowerCase();
+        if (termSeen.has(nameKey)) return false;
+        return !isCFDone(profiles, processedNames, c.name, c.designation, c.company);
+      });
+
+      if (target) {
+        staleScrolls = 0;
+        termSeen.add(target.name.trim().toLowerCase());
+
+        const result = await processCFProfile(
+          driver, target, profiles, sentRef, term, cfState,
+        );
+        if (result === 'sent') termNewConns++;
+
+        // After going back, ensure search is still active
+        await ensureCFSearchActive(driver, term);
+        continue; // re-scan from current position
+      }
+
+      // No unprocessed card visible → scroll down for more
+      const moved = await scrollListDown(driver);
+      if (!moved) {
+        staleScrolls++;
+      } else {
+        staleScrolls = 0;
+      }
+    }
+
+    // ── Term complete ───────────────────────────────────────────────────────
+    cfState.terms[term] = {
+      count:       cfState.terms[term].count || 0,
+      newConns:    termNewConns,
+      status:      'done',
+      completedAt: new Date().toISOString(),
+    };
+    cfState.currentTermIndex = termIdx + 1;
+    saveCFState(cfState);
+
+    console.log(`  ✓ "${term}" done — ${termNewConns} new connection(s).`);
+    playSound(); // audible milestone per completed term
+  }
+
+  console.log('\n✓ All CF terms processed!');
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -765,10 +1132,14 @@ async function main() {
   const profiles = loadProfiles();
   const alreadySent = Array.from(profiles.values()).filter(p => p.status === 'sent').length;
 
+  const modeLabel = CF_MODE   ? '--cf   (search-based connect-find, AA→ZZ)'
+                  : DATA_MODE ? '--data (scrape all + connect, human navigation)'
+                  :             'normal (swipe-pager auto navigation)';
+
   console.log('┌──────────────────────────────────────────────────────┐');
   console.log('│  ATx Enterprise 2026 — Attendee Connector            │');
   console.log('└──────────────────────────────────────────────────────┘');
-  console.log(`  Mode        : ${DATA_MODE ? '--data (scrape all + connect, human navigation)' : 'normal (auto navigation)'}`);
+  console.log(`  Mode        : ${modeLabel}`);
   console.log(`  Device      : ${cfg.device.name}`);
   console.log(`  Package     : ${cfg.device.appPackage}`);
   console.log(`  Output      : ${path.resolve(OUT_DIR)}`);
@@ -783,11 +1154,11 @@ async function main() {
   }
   console.log('');
 
-  let driver = null;
-  let sentThisRun = 0;
+  let driver  = null;
+  const sentRef = { count: 0 }; // shared across modes so shutdown always reports correctly
 
   const shutdown = async (sig) => {
-    console.log(`\nStopped (${sig}).  Sent this run: ${sentThisRun}`);
+    console.log(`\nStopped (${sig}).  Sent this run: ${sentRef.count}`);
     saveProfiles(profiles);
     await writeXLSX(profiles);
     if (driver) try { await driver.deleteSession(); } catch {}
@@ -816,6 +1187,17 @@ async function main() {
   console.log('Connected. Starting…\n');
 
   try {
+    // ══════════════════════════════════════════════════════════════════════════
+    // CF MODE — search-based connect-find
+    // ══════════════════════════════════════════════════════════════════════════
+    if (CF_MODE) {
+      await runCFMode(driver, profiles, sentRef);
+
+    } else {
+    // ══════════════════════════════════════════════════════════════════════════
+    // NORMAL / DATA MODE — swipe-pager based
+    // ══════════════════════════════════════════════════════════════════════════
+
     let batch          = 0;
     let lastSwipedName = null; // name of the last profile seen when pager was exhausted
 
@@ -1059,7 +1441,7 @@ async function main() {
 
           await sendConnectionMessage(driver, firstName);
 
-          sentThisRun++;
+          sentRef.count++;
           upsertProfile(profiles, profileId, {
             name:        currentCard.name,
             designation: currentCard.designation,
@@ -1119,13 +1501,16 @@ async function main() {
 
     } // end outer batch loop
 
+    } // end else (normal / data mode)
+
   } finally {
     saveProfiles(profiles);
     await writeXLSX(profiles);
     const totalSent = Array.from(profiles.values()).filter(p => p.status === 'sent').length;
-    console.log(`\n✓ Done. Sent this run: ${sentThisRun}  |  Total sent: ${totalSent}  |  In DB: ${profiles.size}`);
+    console.log(`\n✓ Done. Sent this run: ${sentRef.count}  |  Total sent: ${totalSent}  |  In DB: ${profiles.size}`);
     console.log(`  JSON : ${path.resolve(VISITED_FILE)}`);
     console.log(`  XLSX : ${path.resolve(XLSX_FILE)}`);
+    if (CF_MODE) console.log(`  CF CSV : ${path.resolve(CF_CSV_DIR)}/`);
     if (driver) await driver.deleteSession();
     playSound();
   }

@@ -31,6 +31,73 @@ const path    = require('path');
 const ExcelJS = require('exceljs');
 const cfg     = require('./config');
 
+// ── Device selection ──────────────────────────────────────────────────────────
+// This machine may run several app scrapers at once, each against its own
+// device/emulator. On startup we list everything `adb` currently sees and:
+//   • 0 devices  → fatal error
+//   • 1 device   → use it automatically, just log which one
+//   • 2+ devices → ask interactively which serial drives this run
+
+function listAdbDevices() {
+  const result = spawnSync('adb', ['devices'], { encoding: 'utf8' });
+  if (result.error) throw new Error(`adb not found: ${result.error.message}`);
+  return (result.stdout || '').split('\n')
+    .slice(1) // skip "List of devices attached" header
+    .map(l => l.trim())
+    .filter(l => l.endsWith('\tdevice') || l.endsWith(' device'))
+    .map(l => l.replace(/\s+device$/, '').trim())
+    .filter(Boolean);
+}
+
+function getEmulatorName(udid) {
+  try {
+    const r = spawnSync('adb', ['-s', udid, 'emu', 'avd', 'name'], { encoding: 'utf8' });
+    const lines = (r.stdout || '').split('\n').map(l => l.trim()).filter(Boolean);
+    return lines[0] || udid;
+  } catch {
+    return udid;
+  }
+}
+
+function askDeviceChoice(prompt) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  return new Promise(resolve => rl.question(prompt, answer => { rl.close(); resolve(answer.trim()); }));
+}
+
+async function selectDevice() {
+  const udids = listAdbDevices();
+
+  if (udids.length === 0) {
+    console.error('No Android devices/emulators found. Connect via USB or start an emulator.');
+    process.exit(1);
+  }
+
+  if (udids.length === 1) {
+    const label = udids[0].startsWith('emulator-') ? getEmulatorName(udids[0]) : udids[0];
+    console.log(`  Device  : ${label} (auto-selected — only one connected)`);
+    return udids[0];
+  }
+
+  console.log('\nConnected devices:');
+  const labels = udids.map((u, i) => {
+    const label = u.startsWith('emulator-') ? `${getEmulatorName(u)} (${u})` : u;
+    console.log(`  [${i + 1}] ${label}`);
+    return label;
+  });
+  console.log('');
+
+  let choice;
+  while (true) {
+    const answer = await askDeviceChoice(`Select device [1-${udids.length}]: `);
+    const n = parseInt(answer, 10);
+    if (n >= 1 && n <= udids.length) { choice = n - 1; break; }
+    console.log(`  Invalid choice — enter a number between 1 and ${udids.length}`);
+  }
+
+  console.log(`  Device  : ${labels[choice]}`);
+  return udids[choice];
+}
+
 // ── Run mode ──────────────────────────────────────────────────────────────────
 // --data  Scrape contact/social for ALL profiles (including pending/connected)
 //         AND send connections.  When the pager exhausts, play an alert and
@@ -762,6 +829,8 @@ function waitForEnter(prompt) {
 async function main() {
   ensureDir(OUT_DIR);
 
+  const deviceUdid = await selectDevice();
+
   const profiles = loadProfiles();
   const alreadySent = Array.from(profiles.values()).filter(p => p.status === 'sent').length;
 
@@ -769,7 +838,6 @@ async function main() {
   console.log('│  ATx Enterprise 2026 — Attendee Connector            │');
   console.log('└──────────────────────────────────────────────────────┘');
   console.log(`  Mode        : ${DATA_MODE ? '--data (scrape all + connect, human navigation)' : 'normal (auto navigation)'}`);
-  console.log(`  Device      : ${cfg.device.name}`);
   console.log(`  Package     : ${cfg.device.appPackage}`);
   console.log(`  Output      : ${path.resolve(OUT_DIR)}`);
   console.log(`  In DB       : ${profiles.size}  |  Sent : ${alreadySent}`);
@@ -804,7 +872,8 @@ async function main() {
     capabilities: {
       platformName:                'Android',
       'appium:automationName':     'UiAutomator2',
-      'appium:deviceName':         cfg.device.name,
+      'appium:deviceName':         deviceUdid,
+      'appium:udid':               deviceUdid,
       'appium:appPackage':         cfg.device.appPackage,
       'appium:appActivity':        cfg.device.appActivity,
       'appium:noReset':            cfg.device.noReset,

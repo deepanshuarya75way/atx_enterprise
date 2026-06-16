@@ -9,20 +9,26 @@ export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$SDK}"
 export PATH="$PATH:$ANDROID_HOME/platform-tools:$ANDROID_HOME/tools"
 
 # ── Appium ─────────────────────────────────────────────────────────────────────
-# Kill any running Appium and start fresh so it inherits ANDROID_HOME above.
-pkill -f "node.*appium" 2>/dev/null || true
-sleep 1
-echo "Starting Appium (ANDROID_HOME=$ANDROID_HOME)..."
-appium --log appium.log --log-level warn > /dev/null 2>&1 &
-sleep 4
+# IMPORTANT: this machine may run several app scrapers at once, each driving
+# its own device. One Appium server can host all of their sessions, so reuse
+# it instead of killing it — killing it here would drop every other app's
+# active session.
+if curl -s http://127.0.0.1:4723/status > /dev/null 2>&1; then
+  echo "Appium server already running — reusing it (shared across concurrent scrapers)."
+else
+  echo "Starting Appium (ANDROID_HOME=$ANDROID_HOME)..."
+  appium --log appium.log --log-level warn > /dev/null 2>&1 &
+  sleep 4
+fi
 
 # ── Device check ───────────────────────────────────────────────────────────────
-DEVICE=$(adb devices | grep -v "List" | grep "device$" | awk '{print $1}' | head -1)
-if [ -z "$DEVICE" ]; then
+# Just a sanity check that *something* is connected — scraper.js / cf_scraper.js
+# themselves prompt interactively to choose WHICH device if more than one is attached.
+DEVICE_COUNT=$(adb devices | grep -v "List" | grep -c "device$" || true)
+if [ "$DEVICE_COUNT" -eq 0 ]; then
   echo "No Android device found. Connect via USB with USB debugging enabled."
   exit 1
 fi
-echo "Device: $DEVICE"
 
 # ── Dependencies ───────────────────────────────────────────────────────────────
 if [ ! -d node_modules ]; then

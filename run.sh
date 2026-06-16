@@ -18,7 +18,22 @@ if curl -s http://127.0.0.1:4723/status > /dev/null 2>&1; then
 else
   echo "Starting Appium (ANDROID_HOME=$ANDROID_HOME)..."
   appium --log appium.log --log-level warn > /dev/null 2>&1 &
-  sleep 4
+
+  # Poll for readiness instead of a blind sleep — a fixed 4s sleep isn't
+  # always enough on a cold start and leaves the scraper hitting ECONNREFUSED.
+  echo "  Waiting for Appium to come up…"
+  for i in $(seq 1 30); do
+    if curl -s http://127.0.0.1:4723/status > /dev/null 2>&1; then
+      break
+    fi
+    sleep 1
+  done
+
+  if ! curl -s http://127.0.0.1:4723/status > /dev/null 2>&1; then
+    echo "ERROR: Appium failed to start within 30s. Check appium.log"
+    exit 1
+  fi
+  echo "  Appium is up."
 fi
 
 # ── Device check ───────────────────────────────────────────────────────────────

@@ -1001,9 +1001,11 @@ async function main() {
         await tapAt(driver, entryCard.center.x, entryCard.center.y);
         await sleep(cfg.timing.afterTap);
 
+        // "Book a meeting" only appears on the real device layout; "About me"
+        // appears on both real device and emulator (1080×2400 layout).
         const profileReady = await waitForEl(
           driver,
-          '//android.widget.TextView[@text="Book a meeting"]',
+          '//android.widget.TextView[@text="Book a meeting" or @text="About me"]',
           cfg.timing.profileTimeout,
         );
         if (!profileReady) {

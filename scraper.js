@@ -112,6 +112,32 @@ const RATE_FILE    = path.join(OUT_DIR, 'rate_limit.json');
 
 const XLSX_COLS = ['profileId', 'name', 'designation', 'company', 'status', 'contact', 'socialMedia', 'processedAt'];
 
+// Daily CSV — one file per calendar day, only profiles we actually sent to.
+const CSV_HEADERS = ['name', 'designation', 'company', 'contact', 'socialMedia', 'sentAt'];
+
+function getDailyCsvFile() {
+  const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
+  return path.join(OUT_DIR, `profiles_${today}.csv`);
+}
+
+function csvEscape(val) {
+  const s = val == null ? '' : Array.isArray(val) ? val.join('; ') : String(val);
+  return s.includes(',') || s.includes('"') || s.includes('\n')
+    ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function appendToDailyCsv(profile) {
+  ensureDir(OUT_DIR);
+  const file = getDailyCsvFile();
+  const needsHeader = !fs.existsSync(file);
+  const row = CSV_HEADERS.map(col => {
+    if (col === 'sentAt') return csvEscape(profile.processedAt);
+    return csvEscape(profile[col]);
+  }).join(',');
+  const line = (needsHeader ? CSV_HEADERS.join(',') + '\n' : '') + row + '\n';
+  fs.appendFileSync(file, line);
+}
+
 const RATE_SEQUENCE_MS = [30 * 60 * 1000, 10 * 60 * 1000, 5 * 60 * 1000];
 
 // Domain substrings used to classify a text link as a social media URL.
@@ -216,8 +242,9 @@ async function writeXLSX(map) {
   ws.addRow(XLSX_COLS);
   ws.getRow(1).font = { bold: true };
 
-  // Data rows — only today's records (processedAt starts with today's date)
+  // Only write profiles we actually sent to today — skip connected/pending/skipped.
   for (const p of map.values()) {
+    if (p.status !== 'sent') continue;
     if (!p.processedAt || !p.processedAt.startsWith(sheetName)) continue;
     ws.addRow(XLSX_COLS.map(c => cellValue(p[c])));
   }
@@ -1161,7 +1188,7 @@ async function main() {
           await sendConnectionMessage(driver, firstName);
 
           sentThisRun++;
-          upsertProfile(profiles, profileId, {
+          const sentRecord = upsertProfile(profiles, profileId, {
             name:        currentCard.name,
             designation: currentCard.designation,
             company:     currentCard.company,
@@ -1171,6 +1198,7 @@ async function main() {
           });
           saveProfiles(profiles);
           await writeXLSX(profiles);
+          appendToDailyCsv(sentRecord); // daily CSV: sent profiles only
           console.log(`    ✓ sent  (total this run: ${sentThisRun})`);
 
           await sleep(cfg.timing.settle * 3);

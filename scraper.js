@@ -308,6 +308,20 @@ function parseBoundsRect(b) {
   return { x1, y1, x2, y2, cx: Math.round((x1 + x2) / 2), cy: Math.round((y1 + y2) / 2) };
 }
 
+// Derive screen dimensions from the XML hierarchy so y-range checks scale
+// across devices with different pixel densities (e.g. 720×1560 real vs 1080×2400 emulator).
+function getScreenSize(elements) {
+  let maxArea = 0;
+  let sw = 720, sh = 1560;
+  for (const el of elements) {
+    const b = parseBoundsRect(el.bounds);
+    if (!b || b.x1 !== 0 || b.y1 !== 0 || b.x2 === 0) continue;
+    const area = b.x2 * b.y2;
+    if (area > maxArea) { maxArea = area; sw = b.x2; sh = b.y2; }
+  }
+  return { sw, sh };
+}
+
 // ── Tap / Swipe helpers ───────────────────────────────────────────────────────
 
 async function tapAt(driver, x, y) {
@@ -574,8 +588,12 @@ function getCurrentProfileInfo(elements) {
     const b = parseBoundsRect(el.bounds);
     return b && !(b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0);
   });
-  const yMin = 400;
-  const yMax = hasQualifyPanel ? 1150 : 700;
+  // Use screen-relative ranges so the same logic works across device densities.
+  // 720×1560 real device: yMin=312, yMax=702 (normal) / 1170 (qualify)
+  // 1080×2400 emulator:   yMin=480, yMax=1080 (normal) / 1800 (qualify)
+  const { sh } = getScreenSize(elements);
+  const yMin = Math.round(sh * 0.20);
+  const yMax = hasQualifyPanel ? Math.round(sh * 0.75) : Math.round(sh * 0.45);
 
   const candidates = [];
   for (const el of elements) {
@@ -632,6 +650,10 @@ function fmtProfile(name, designation, company) {
  *   3. Fall back to tapping the text bounds directly if no container is found.
  */
 function findConnectButtonBounds(elements) {
+  const { sh } = getScreenSize(elements);
+  const yLo = Math.round(sh * 0.25); // ~390 on 1560h, ~600 on 2400h
+  const yHi = Math.round(sh * 0.68); // ~1061 on 1560h, ~1632 on 2400h
+
   // 1. Locate the "Connect" label with real bounds
   let connectText = null;
   for (const el of elements) {
@@ -639,7 +661,7 @@ function findConnectButtonBounds(elements) {
     if ((el.text || '').trim() !== 'Connect') continue;
     const b = parseBoundsRect(el.bounds);
     if (!b || (b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) continue;
-    if (b.y1 < 600 || b.y1 > 900) continue;
+    if (b.y1 < yLo || b.y1 > yHi) continue;
     connectText = b;
     break;
   }

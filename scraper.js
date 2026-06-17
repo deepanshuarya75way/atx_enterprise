@@ -775,29 +775,37 @@ async function sendConnectionMessage(driver, firstName) {
   await msgInput.setValue(message);
   await sleep(cfg.timing.afterType);
 
-  // Tap the "Connect" button in the dialog.
-  // It's a clickable View whose only child is a TextView with text "Connect".
-  // Try XPath first; fall back to fixed coords if XPath misses.
-  let tapped = false;
-  try {
-    const connectViews = await driver.$$(
-      '//android.view.View[@clickable="true"]',
-    );
-    for (const v of connectViews) {
-      try {
-        const children = await v.$$('./android.widget.TextView[@text="Connect"]');
-        if (children.length > 0) {
-          await v.click();
-          tapped = true;
-          break;
-        }
-      } catch {}
-    }
-  } catch {}
+  // Find and tap the "Connect" button in the dialog using parseSource so the
+  // coordinates work on any screen size (the old fixed fallback of y=808 landed
+  // inside the EditText on 1080×2400 emulators where the button sits at y≈1034).
+  const dialogXml = await driver.getPageSource();
+  const dialogEls = parseSource(dialogXml);
 
-  if (!tapped) {
-    // Fallback: tap fixed coordinates for the Connect button in dialog
-    await tapAt(driver, 360, 808);
+  // Locate the "Connect" label, then find its smallest clickable container.
+  let connectDialogR = null;
+  for (const el of dialogEls) {
+    if ((el.text || '').trim() !== 'Connect') continue;
+    const b = parseBoundsRect(el.bounds);
+    if (!b || (b.x1 === 0 && b.y1 === 0 && b.x2 === 0 && b.y2 === 0)) continue;
+    let best = null, bestArea = Infinity;
+    for (const c of dialogEls) {
+      if (c.clickable !== 'true') continue;
+      const r = parseBoundsRect(c.bounds);
+      if (!r || (r.x1 === 0 && r.y1 === 0 && r.x2 === 0 && r.y2 === 0)) continue;
+      if (r.x1 > b.x1 || r.x2 < b.x2 || r.y1 > b.y1 || r.y2 < b.y2) continue;
+      const area = (r.x2 - r.x1) * (r.y2 - r.y1);
+      if (area < bestArea) { best = r; bestArea = area; }
+    }
+    connectDialogR = best || b;
+    break;
+  }
+
+  if (connectDialogR) {
+    await tapAt(driver, connectDialogR.cx, connectDialogR.cy);
+  } else {
+    // Last-resort fallback using screen-width centre and a proportional y
+    const { width, height } = await driver.getWindowSize();
+    await tapAt(driver, Math.round(width / 2), Math.round(height * 0.43));
   }
 
   // Poll for dialog dismissal

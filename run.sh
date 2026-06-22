@@ -59,14 +59,22 @@ fi
 
 MODE=""
 CF_MODE=false
+FOLLOWUP_MODE=false
+DRYRUN=""
 for arg in "$@"; do
   case "$arg" in
-    --data) MODE="--data" ;;
-    --cf)   CF_MODE=true  ;;
+    --data)    MODE="--data"    ;;
+    --cf)      CF_MODE=true     ;;
+    --followup) FOLLOWUP_MODE=true ;;
+    --dryrun)  DRYRUN="--dryrun" ;;
+    --reset)   MODE="$MODE --reset" ;;
   esac
 done
 
-if [ "$CF_MODE" = true ]; then
+if [ "$FOLLOWUP_MODE" = true ]; then
+  echo "Starting ATx Follow-up Sender${DRYRUN:+ (dry-run)}..."
+  node followup_scraper.js $DRYRUN
+elif [ "$CF_MODE" = true ]; then
   echo "Starting ATx Enterprise 2026 Connector (--cf / Connect-Find mode)..."
   node cf_scraper.js
 else

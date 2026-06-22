@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "exceljs": "^4.4.0",
+    "openai": "^6.44.0",
     "webdriverio": "^8.39.0"
   }
 }

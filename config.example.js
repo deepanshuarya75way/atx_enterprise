@@ -19,6 +19,10 @@ module.exports = {
   // ── Output ─────────────────────────────────────────────────────────────────
   outputDir: './output',
 
+  // ── OpenAI (used by followup_scraper.js) ──────────────────────────────────
+  // Can also be set via OPENAI_API_KEY environment variable.
+  openaiApiKey: 'YOUR_OPENAI_API_KEY_HERE',
+
   // ── Connection message ─────────────────────────────────────────────────────
   // {{first_name}} is replaced at runtime with the person's first name.
   // Max 1000 chars (app limit).

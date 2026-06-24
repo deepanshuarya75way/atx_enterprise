@@ -1054,8 +1054,10 @@ async function main() {
 
       // ── Phase 3: Swipe-based processing loop (one pager batch ~40 cards) ──
       let currentCard = entryCard;
-      let swipeMisses = 0;
-      let prevName    = null;
+      let swipeMisses  = 0;
+      let prevName     = null;
+      let stuckName    = null;
+      let stuckCount   = 0;
 
       while (true) {
         // Read profile state — retry once if name wasn't detected
@@ -1140,6 +1142,15 @@ async function main() {
           const reason = isPending ? 'pending' : 'already connected';
           const label  = DATA_MODE ? '[data]' : '[skip]';
           console.log(`  ${label} ${displayFull} — ${reason}`);
+          if (!isPending) {
+            if (currentCard.name === stuckName) {
+              stuckCount++;
+              if (stuckCount >= 10) { playSound(); stuckCount = 0; }
+            } else {
+              stuckName  = currentCard.name;
+              stuckCount = 1;
+            }
+          }
           // Preserve terminal status already in DB (e.g. 'sent' → don't overwrite to 'pending')
           const existingStatus = profiles.get(profileId)?.status;
           const newStatus = TERMINAL_STATUSES.has(existingStatus)

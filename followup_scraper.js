@@ -393,17 +393,79 @@ function parseChatMessages(elements) {
 }
 
 /**
- * Scroll chat to bottom so the latest messages are visible.
+ * Collect the full chat history by scrolling to the top first, then
+ * back to the bottom, capturing every message bubble along the way.
+ * Returns messages deduplicated and sorted oldest→newest.
+ * The chat view is at the bottom (send button visible) when this returns.
+ *
+ * Scroll directions (Android):
+ *   finger moves UP   (startY > endY) → content scrolls up   → newer msgs visible
+ *   finger moves DOWN (startY < endY) → content scrolls down → older msgs visible
  */
-async function scrollChatToBottom(driver) {
+async function collectFullChatHistory(driver) {
   const { width, height } = await driver.getWindowSize();
-  // Swipe up (finger moves up = content moves up = we see newer messages)
-  for (let i = 0; i < 5; i++) {
-    await swipeUp(driver, Math.round(height * 0.75), Math.round(height * 0.25), Math.round(width / 2));
-    await sleep(400);
-    // Check if we've reached the bottom by seeing if page source changes
+  const cx = Math.round(width / 2);
+  // finger moves DOWN → older messages scroll into view (toward top of chat)
+  const toOlderY1 = Math.round(height * 0.25);
+  const toOlderY2 = Math.round(height * 0.75);
+  // finger moves UP → newer messages scroll into view (toward bottom of chat)
+  const toNewerY1 = Math.round(height * 0.75);
+  const toNewerY2 = Math.round(height * 0.25);
+
+  // Dedup key: sender + first 60 chars of text.
+  // Prefer the version WITH a dateLabel so timestamps are correct.
+  const seen    = new Map();
+  const addMsgs = msgs => {
+    for (const m of msgs) {
+      const k = `${m.sender}|${m.text.slice(0, 60)}`;
+      const ex = seen.get(k);
+      if (!ex || (!ex.dateLabel && m.dateLabel)) seen.set(k, m);
+    }
+  };
+
+  const SEND_ID = `${PKG}:id/sendButton`;
+
+  // ── Phase 1: scroll toward top to collect older messages ─────────────────
+  let stale = 0;
+  for (let i = 0; i < 25 && stale < 3; i++) {
+    const xml  = await driver.getPageSource();
+    const els  = parseSource(xml);
+    const before = seen.size;
+    addMsgs(parseChatMessages(els));
+    if (seen.size === before) stale++; else stale = 0;
+    // Stop early if we can see the very first message (date separator at top of screen is low y)
+    const firstSep = els.find(e => e['resource-id'] === `${PKG}:id/title`);
+    if (firstSep) {
+      const b = parseBoundsRect(firstSep.bounds);
+      if (b && b.y1 < height * 0.25 && stale >= 1) break;
+    }
+    await swipeUp(driver, toOlderY1, toOlderY2, cx);
+    await sleep(500);
   }
-  await sleep(600);
+
+  // ── Phase 2: scroll back to bottom (send button visible) ─────────────────
+  stale = 0;
+  for (let i = 0; i < 30; i++) {
+    const xml = await driver.getPageSource();
+    const els = parseSource(xml);
+    addMsgs(parseChatMessages(els));
+    if (els.some(e => e['resource-id'] === SEND_ID)) break; // reached bottom
+    await swipeUp(driver, toNewerY1, toNewerY2, cx);
+    await sleep(450);
+  }
+
+  await sleep(300);
+
+  // Forward-fill missing dateLabels: any message without one inherits from
+  // the previous message that did have one.  Then recompute timestamp.
+  const sorted = [...seen.values()].sort((a, b) => (a.timestamp - b.timestamp) || (a.y - b.y));
+  let lastDate = '';
+  for (const m of sorted) {
+    if (m.dateLabel) { lastDate = m.dateLabel; }
+    else if (lastDate)  { m.dateLabel = lastDate; m.timestamp = parseMessageTimestamp(lastDate, m.time); }
+  }
+
+  return sorted;
 }
 
 // ── OpenAI follow-up generation ───────────────────────────────────────────────
@@ -430,9 +492,13 @@ Task: Write a concise, warm follow-up message (2-4 short paragraphs, max 300 wor
 - Gently re-surfaces the value of 75Way's services (AI agents, automation, custom software)
 - Ends with a simple, low-pressure call to action (e.g. a brief 15-min call)
 - Sounds human, not templated
-- Sign off as "Lokesh" (just the first name, no title)
 
-Output ONLY the message text, no subject line, no explanation.`;
+STRICT RULES — violating any of these is unacceptable:
+- NO signature, sign-off, or closing (no "Best,", no "Regards,", no "Lokesh", no "75Way", nothing)
+- NO placeholders of any kind (no "[Your Name]", no "[Name]", no brackets at all)
+- End the message with the call-to-action sentence. Nothing after it.
+
+Output ONLY the message body. No subject line, no explanation, no signature.`;
 
   const res = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -510,6 +576,45 @@ async function scrollMessageListDown(driver) {
   await sleep(600);
 }
 
+// ── Navigate to the Messages tab ─────────────────────────────────────────────
+
+/**
+ * From any screen, ensure we land on the Messages list.
+ * - If inside a chat (sendButton/textMessage visible) → back()
+ * - Then tap the messages icon in the bottom nav (3rd item, x≈62% screen width)
+ * - Waits up to 5 s for id/name elements to appear (messages loaded)
+ */
+async function navigateToMessages(driver) {
+  const { width, height } = await driver.getWindowSize();
+
+  // Escape from a chat if needed (press back until we're out)
+  for (let i = 0; i < 5; i++) {
+    const xml = await driver.getPageSource();
+    const els = parseSource(xml);
+    const inChat = els.some(e => e['resource-id'] === `${PKG}:id/sendButton`);
+    const onList = els.some(e => e['resource-id'] === `${PKG}:id/name`);
+    if (onList) break;
+    if (inChat) { await driver.back(); await sleep(800); }
+    else break;
+  }
+
+  // Tap the Messages tab in bottom nav.
+  // The tab is the 3rd of 4 items → x ≈ 62.5% of screen width
+  // (home=12.5%, notifications=37.5%, messages=62.5%, profile=87.5%)
+  const msgTabX = Math.round(width * 0.625);
+  const msgTabY = Math.round(height * 0.93);
+  await tapAt(driver, msgTabX, msgTabY);
+  await sleep(2000);
+
+  // Wait for messages to load (id/name elements appear)
+  for (let i = 0; i < 10; i++) {
+    const xml = await driver.getPageSource();
+    if (parseSource(xml).some(e => e['resource-id'] === `${PKG}:id/name`)) return;
+    await sleep(500);
+  }
+  console.warn('  Warning: Messages list did not load after navigation.');
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -544,8 +649,11 @@ async function main() {
   });
 
   console.log('  Connected to Appium.\n');
-  console.log('  IMPORTANT: Make sure the app is on the Messages screen.\n');
   await sleep(1500);
+
+  console.log('  Navigating to Messages tab...');
+  await navigateToMessages(driver);
+  console.log('  On Messages list.\n');
 
   let totalSent = 0, totalSkipped = 0, totalNoAction = 0;
   let staleScrolls = 0;
@@ -584,12 +692,14 @@ async function main() {
       await tapAt(driver, row.center.x, row.center.y);
       await sleep(cfg.timing.afterTap);
 
-      // Scroll chat to bottom to see newest messages
-      await scrollChatToBottom(driver);
+      // Collect full chat history (scrolls to top then back to bottom)
+      console.log('    Collecting chat history...');
+      const messages = await collectFullChatHistory(driver);
+      console.log(`    ${messages.length} message(s) collected.`);
 
+      // Get fresh page source at the bottom for send button reference
       const chatXml = await driver.getPageSource();
       const chatEls = parseSource(chatXml);
-      const messages = parseChatMessages(chatEls);
 
       if (messages.length === 0) {
         console.log('    No messages parsed — skipping.');
